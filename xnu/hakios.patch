@@ -2091,7 +2091,7 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..e29cb9f31a84 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2104,19 +2104,31 @@ index e26a1d70f470..f91095c98d26 100644
  
  #include <console/serial_protos.h>
  
-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
+@@ -334,7 +337,14 @@ arm_setup_pre_sign(void)
+  *		Function:		Runs on the boot CPU, once, on entry from iBoot.
   */
  
++#if __ARM_PAN_AVAILABLE__
++unsigned int arm64_pan_supported = 1;    /* HakiOS: set in arm_init() from ID_AA64MMFR1_EL1 */
++#endif
++
  __startup_func
 +/* Bring-up checkpoints, see osfmk/arm64/loader_return.c */
 +extern void loader_checkpoint(uint64_t n);
 +
  void
-+
  arm_init(
  	boot_args       *args)
- {
-@@ -354,6 +361,7 @@ arm_init(
+@@ -350,10 +360,16 @@ arm_init(
+ 
+ 	arm_slide_rebase_and_sign_image();
+ 
++#if __ARM_PAN_AVAILABLE__
++	/* HakiOS: before the first access to PAN (see arm64_pan_set() in proc_reg.h) */
++	arm64_pan_supported = ((__builtin_arm_rsr64("ID_AA64MMFR1_EL1") >> 20) & 0xf) != 0;
++#endif
++
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -2124,7 +2136,7 @@ index e26a1d70f470..f91095c98d26 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
+@@ -362,14 +378,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -2144,7 +2156,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
+@@ -385,6 +406,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -2152,7 +2164,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -422,10 +444,13 @@ arm_init(
  	}
  #endif
  
@@ -2166,7 +2178,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +464,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2181,7 +2193,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +480,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2198,7 +2210,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,6 +497,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -2206,7 +2218,12 @@ index e26a1d70f470..f91095c98d26 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +539,7 @@ arm_init(
+@@ -510,10 +543,11 @@ arm_init(
+ 	PE_parse_boot_argn("immediate_NMI", &force_immediate_debug_halt, sizeof(force_immediate_debug_halt));
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	arm64_pan_set(1);
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
  	arm_vm_init(xmaxmem, args);
@@ -2214,7 +2231,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,7 +561,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2224,7 +2241,7 @@ index e26a1d70f470..f91095c98d26 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+@@ -569,6 +605,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2232,7 +2249,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +684,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2240,7 +2257,16 @@ index e26a1d70f470..f91095c98d26 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -661,7 +699,7 @@ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	arm64_pan_set(1);
+ #endif
+ 
+ #ifdef __arm64__
+@@ -673,6 +711,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2250,6 +2276,15 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -793,7 +834,7 @@ arm_init_idle_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	arm64_pan_set(1);
+ #endif
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2279,7 +2314,7 @@ index 39daaf8db949..64ceb1a5f201 100644
  	}
  	os_atomic_clear_exclusive();
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index fc2096fa0010..8f198ed1b820 100644
+index fc2096fa0010..6c522b247c1a 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -93,6 +93,8 @@
@@ -2332,6 +2367,24 @@ index fc2096fa0010..8f198ed1b820 100644
  #endif
  }
  
+@@ -13847,7 +13852,7 @@ pmap_test_access(pmap_t pmap, vm_map_address_t va, bool should_fault, bool is_wr
+ 
+ 		/* Disable PAN; pmap shouldn't be the kernel pmap. */
+ #if __ARM_PAN_AVAILABLE__
+-		__builtin_arm_wsr("pan", 0);
++		arm64_pan_set(0);
+ #endif /* __ARM_PAN_AVAILABLE__ */
+ 	}
+ 
+@@ -13866,7 +13871,7 @@ pmap_test_access(pmap_t pmap, vm_map_address_t va, bool should_fault, bool is_wr
+ 
+ 	if (pmap != NULL) {
+ #if __ARM_PAN_AVAILABLE__
+-		__builtin_arm_wsr("pan", 1);
++		arm64_pan_set(1);
+ #endif /* __ARM_PAN_AVAILABLE__ */
+ 
+ 		pmap_switch(old_pmap);
 diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
 index df672c65b144..d7e1da7c5db2 100644
 --- a/osfmk/arm/pmap/pmap.h
@@ -2360,6 +2413,30 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
+index 15b949c659ad..264c4ddaa0ad 100644
+--- a/osfmk/arm64/copyio.c
++++ b/osfmk/arm64/copyio.c
+@@ -86,8 +86,8 @@ static inline void
+ user_access_enable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	assert(__builtin_arm_rsr("pan") != 0);
+-	__builtin_arm_wsr("pan", 0);
++	assert(arm64_pan_get() != 0);
++	arm64_pan_set(0);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ }
+@@ -96,7 +96,7 @@ static inline void
+ user_access_disable(void)
+ {
+ #if __ARM_PAN_AVAILABLE__
+-	__builtin_arm_wsr("pan", 1);
++	arm64_pan_set(1);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ }
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2595,6 +2672,67 @@ index e76e7e70ab9c..828a51171c7e 100644
  }
  
  void
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+index 7b98a3323d3a..0c31d484b94b 100644
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -168,7 +168,7 @@ machine_switch_context(thread_t old,
+ 	thread_t retval;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (__improbable(arm64_pan_get() == 0)) {
+ 		panic("context switch with PAN disabled");
+ 	}
+ #endif
+@@ -511,7 +511,7 @@ machine_stack_handoff(thread_t old,
+ 	vm_offset_t  stack;
+ 
+ #if __ARM_PAN_AVAILABLE__
+-	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
++	if (__improbable(arm64_pan_get() == 0)) {
+ 		panic("stack handoff with PAN disabled");
+ 	}
+ #endif
+diff --git a/osfmk/arm64/platform_tests.c b/osfmk/arm64/platform_tests.c
+index b58b94d1eeb3..db803fb4f9ef 100644
+--- a/osfmk/arm64/platform_tests.c
++++ b/osfmk/arm64/platform_tests.c
+@@ -1349,6 +1349,11 @@ arm64_pan_test()
+ 
+ 	T_LOG("Testing PAN.");
+ 
++	if (!arm64_pan_supported) {
++		T_LOG("PAN is not implemented on this core (ARMv8.0): nothing to test.");
++		return KERN_SUCCESS;
++	}
++
+ 
+ 	T_ASSERT((__builtin_arm_rsr("SCTLR_EL1") & SCTLR_PAN_UNCHANGED) == 0, "SCTLR_EL1.SPAN must be cleared");
+ 
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 133b07fd6155..f66488a30bdb 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -519,6 +519,18 @@
+ #define PSR64_KERNEL_DEFAULT    PSR64_KERNEL_STANDARD
+ #endif
+ 
++#if __ARM_PAN_AVAILABLE__ && !defined(__ASSEMBLER__)
++/*
++ * HakiOS: PAN is ARMv8.1. An ARMv8.0 core (the Galaxy A51's Cortex-A53 and -A73) has no PAN register, and
++ * "msr/mrs PAN" is undefined there; arm_init() reads ID_AA64MMFR1_EL1.PAN once, and every access goes
++ * through these. Where PAN is not implemented it reads as set (the kernel's checks expect it so) and
++ * writes are skipped. (PSR64_PAN in a saved SPSR is RES0 there: ignored by ERET.)
++ */
++extern unsigned int arm64_pan_supported;
++#define arm64_pan_set(v)        do { if (arm64_pan_supported) { __builtin_arm_wsr("pan", (v)); } } while (0)
++#define arm64_pan_get()         (arm64_pan_supported ? __builtin_arm_rsr("pan") : 1)
++#endif
++
+ #define PSR64_IS_KERNEL(x)      ((x & PSR64_MODE_EL_MASK) > PSR64_MODE_EL0)
+ #define PSR64_IS_USER(x)        ((x & PSR64_MODE_EL_MASK) == PSR64_MODE_EL0)
+ 
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s

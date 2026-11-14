@@ -15,7 +15,13 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+/*
+ * Where the boot shim puts the payload: 0xF0000000 on redwood and in QEMU; another phone's UEFI platform may reserve
+ * another window (the Galaxy A51's 0xF0000000 is its modem's carve-out: 0xC1000000 there). Chosen in efi_main() by
+ * the display, before anything reads the payload.
+ */
+static uint64_t payload_base = 0xF0000000ULL;
+#define PAYLOAD_BASE        payload_base
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -554,18 +560,51 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_cpuif;              /* GICv2: the CPU interface (used when the cores have no GIC system registers) */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+	int cluster_size;                /* or, when not 0: core N is cluster N / cluster_size (MPIDR Aff1), core N % cluster_size in it (Aff0) */
+	int psci_entry_low;              /* the firmware's CPU_ON takes only entry points below 4 GB: the kernel's go through a trampoline */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 };
 
+/* The MPIDR (Aff1.Aff0) of the platform's core number N, and back */
+static uint64_t
+core_mpidr(const struct platform *plat, int core)
+{
+	if (plat->cluster_size != 0) {
+		return ((uint64_t)(core / plat->cluster_size) << 8) | (uint64_t)(core % plat->cluster_size);
+	}
+	return (uint64_t)core << plat->core_shift;
+}
+
+static int
+mpidr_core(const struct platform *plat, uint64_t mpidr)
+{
+	if (plat->cluster_size != 0) {
+		return (int)(((mpidr >> 8) & 0xff) * plat->cluster_size + (mpidr & 0xff));
+	}
+	return (int)(mpidr >> plat->core_shift);
+}
+
+/* A GICv3 CPU interface in system registers (ID_AA64PFR0_EL1.GIC != 0); without one the GIC is a GICv2. */
+static int
+gic_has_sysregs(void)
+{
+	uint64_t pfr0;
+
+	__asm__ volatile ("mrs %0, id_aa64pfr0_el1" : "=r" (pfr0));
+	return ((pfr0 >> 24) & 0xf) != 0;
+}
+
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
 	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
+	.gic_cpuif = 0x08010000,         /* -M virt,gic-version=2 */
 	.cores = 8, .core_shift = 0,
 	/*
 	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
@@ -586,6 +625,27 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+};
+
+/*
+ * Samsung Galaxy A51 (SM-A515F, Exynos 9611): recognised by S-Boot's framebuffer, which its UEFI hands on
+ * (devices/a51/uefi). Its interrupt controller is a GIC-400 (GICv2), which the kernel's gic_v3_irq.c drives
+ * through its GICv2 path, told by the cores' lack of GIC system registers.
+ */
+#define A51_FB_BASE         0xCA000000ULL
+#define A51_PAYLOAD_BASE    0xC1000000ULL
+
+static const struct platform platform_a51 = {
+	.name = "a51", .io_base = 0x10000000, .io_size = 0x10000000,
+	.gic_dist = 0x12301000, .gic_redist = 0, .gic_cpuif = 0x12302000,   /* GIC-400 (GICv2): no redistributor */
+	.uart = 0,                                   /* samsung,exynos-uart at 0x13820000, not a PL011 */
+	.cores = 8, .cluster_size = 4,               /* cores 0-3: Cortex-A53, MPIDR 0x0-0x3; cores 4-7: Cortex-A73, MPIDR 0x100-0x103 */
+	.small_cores = 0x0f,
+	/*
+	 * Its CPU_ON starts the loader's stub at 0xA1xxxxxx, but a kernel entry above 4 GB (where the kernel's window is,
+	 * 0x880000000) reset the whole phone: the firmware treats PSCI values as 32-bit (AFFINITY_INFO too)
+	 */
+	.psci_entry_low = 1,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -654,10 +714,15 @@ __asm__ (
         "  mrs x9, mdscr_el1\n     str x9, [x10, #320]\n"
         "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
         "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
-        /* GICv3 CPU interface: the kernel reprograms it for its own interrupts */
+        /* GICv3 CPU interface: the kernel reprograms it for its own interrupts. A GICv2 (no system-register
+         * interface, ID_AA64PFR0_EL1.GIC == 0) has none of these registers: they would be undefined there. */
+        "  mrs x11, id_aa64pfr0_el1\n"
+        "  ubfx x11, x11, #24, #4\n"
+        "  cbz x11, 3f\n"
         "  mrs x9, icc_pmr_el1\n     str x9, [x10, #344]\n"
         "  mrs x9, icc_igrpen1_el1\n str x9, [x10, #352]\n"
         "  mrs x9, icc_bpr1_el1\n    str x9, [x10, #360]\n"
+        "3:\n"
         "  mrs x9, spsel\n"
         "  cbz x9, 1f\n"                  /* SP_EL0 is only accessible while running on SP_EL1 */
         "  mrs x9, sp_el0\n        str x9, [x10, #304]\n"
@@ -678,8 +743,18 @@ __asm__ (
         /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
          * UEFI maps its memory as EL0-accessible, so with PAN every data access
          * (including the exception handler's own stack push) faults. */
+        /* only where they exist: PAN is ARMv8.1, UAO ARMv8.2, and on an ARMv8.0 core (the Galaxy A51's
+         * Cortex-A53/A73) either instruction is undefined -- the way back would fault before it began */
+        "  mrs x9, id_aa64mmfr1_el1\n"
+        "  ubfx x9, x9, #20, #4\n"      /* PAN */
+        "  cbz x9, 4f\n"
         "  .inst 0xd500409f\n"          /* msr PAN, #0 */
+        "4:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n"
+        "  ubfx x9, x9, #4, #4\n"       /* UAO */
+        "  cbz x9, 5f\n"
         "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        "5:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -714,9 +789,13 @@ __asm__ (
         "  ldr x9, [x10, #296]\n msr tpidrro_el0, x9\n"
         "  ldr x9, [x10, #312]\n msr contextidr_el1, x9\n"
         "  ldr x9, [x10, #320]\n msr mdscr_el1, x9\n"
+        "  mrs x11, id_aa64pfr0_el1\n"     /* GICv3 only (see loader_save_ctx) */
+        "  ubfx x11, x11, #24, #4\n"
+        "  cbz x11, 3f\n"
         "  ldr x9, [x10, #344]\n msr icc_pmr_el1, x9\n"
         "  ldr x9, [x10, #360]\n msr icc_bpr1_el1, x9\n"
         "  ldr x9, [x10, #352]\n msr icc_igrpen1_el1, x9\n"
+        "3:\n"
         "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
         "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
         "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
@@ -823,6 +902,10 @@ __asm__ (
         "  add  x9, x9, :lo12:other_cpu_stage\n"
         "  mov x10, #1\n"
         "  str x10, [x9]\n"
+        /* &other_cpu_start, found here rather than taken from x0: PSCI's CPU_ON hands its context_id to the new
+         * core in x0, but the Galaxy A51's firmware gives something else (0xbfffe01c) */
+        "  adrp x0, other_cpu_start\n"
+        "  add  x0, x0, :lo12:other_cpu_start\n"
         "  ldp x9, x10, [x0]\n"
         "  mov x0, x10\n"
         "  br x9\n"
@@ -850,8 +933,18 @@ __asm__ (
         ".globl other_cpu_return_stub\n"
         "other_cpu_return_stub:\n"              /* x0..x7 as for loader_return_stub */
         "  msr daifset, #0xf\n"
-        "  .inst 0xd500409f\n"                  /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"                  /* msr UAO, #0 */
+        /* only where they exist: PAN is ARMv8.1, UAO ARMv8.2, and on an ARMv8.0 core (the Galaxy A51's
+         * Cortex-A53/A73) either instruction is undefined -- the way back would fault before it began */
+        "  mrs x9, id_aa64mmfr1_el1\n"
+        "  ubfx x9, x9, #20, #4\n"      /* PAN */
+        "  cbz x9, 4f\n"
+        "  .inst 0xd500409f\n"          /* msr PAN, #0 */
+        "4:\n"
+        "  mrs x9, id_aa64mmfr2_el1\n"
+        "  ubfx x9, x9, #4, #4\n"       /* UAO */
+        "  cbz x9, 5f\n"
+        "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        "5:\n"
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -2302,7 +2395,41 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 		status = (int64_t)smc_call(function, a1, a2, NULL, NULL);
 		smc_x3 = 0;
 	}
-	return status;
+	/*
+	 * PSCI's return values are 32-bit (PSCI 1.1, 5.2.2), even for its SMC64 functions; the Galaxy A51's firmware
+	 * leaves the upper half of x0 clear (AFFINITY_INFO's NOT_SUPPORTED came back as 4294967295).
+	 */
+	return (int64_t)(int32_t)status;
+}
+
+/*
+ * A PSCI entry point below 4 GB for a kernel that lives above it: "ldr x9, slot; br x9" and the slot, in a page of
+ * UEFI's that is outside the kernel's window. The kernel (osfmk/arm64/psci_smp.c) finds it as
+ * /chosen/psci-entry-trampoline, writes its own entry into the slot (offset 8) through an uncached mapping and gives
+ * the firmware the trampoline instead. The new core runs it with its MMU and caches off, from memory.
+ */
+static uint64_t psci_trampoline_pa;
+
+static void
+psci_trampoline_make(void)
+{
+	uint64_t page = 0xFFFFF000ULL;
+
+	if (psci_trampoline_pa != 0) {
+		return;
+	}
+	if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, 1, &page))) {
+		print("psci: no page below 4 GB for the CPU_ON trampoline\n");
+		return;
+	}
+	volatile uint32_t *code = (volatile uint32_t *)(uintptr_t)page;
+	code[0] = 0x58000049;           /* ldr x9, #8 */
+	code[1] = 0xd61f0120;           /* br x9 */
+	*(volatile uint64_t *)(uintptr_t)(page + 8) = 0;
+	flush_dcache(page, page + 16);
+	__asm__ volatile ("ic iallu\n dsb sy\n isb");
+	psci_trampoline_pa = page;
+	print("psci: CPU_ON trampoline at %x (the kernel's entry points are above 4 GB)\n", page);
 }
 
 /*
@@ -2371,8 +2498,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");
-			group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
-			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+			if (gic_has_sysregs()) {
+				group1 = READ_SYSREG(S3_0_C12_C12_7);  /* ICC_IGRPEN1_EL1 */
+				__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+			}
 		}
 		/* both are written by a core with its caches off: look at memory, not at our copy */
 		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
@@ -2436,7 +2565,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	run_active = 0;
 
 	if (watching_only) {
-		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+		if (gic_has_sysregs()) {
+			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+		}
 		__asm__ volatile ("msr daif, %0" : : "r" (daif));
 	}
 	return status;
@@ -3013,8 +3144,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_probe_requested = 0;
 	block_enabled = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "psci_trampoline=1") && (c == pi.cmdline || c[-1] == ' ')) {
+			psci_trampoline_make();         /* (for trying it where the firmware does not need it: QEMU) */
+		}
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			kernel_mpidr = core_mpidr(PLAT, c[8] - '0');
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
@@ -3244,6 +3378,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "display-rotation", 0);
 	/* how the kernel is to ask the firmware for more cores (PSCI) */
 	dt_prop_str(&w, "psci-method", plat->psci_hvc ? "hvc" : "smc");
+	if (plat->psci_entry_low) {
+		psci_trampoline_make();
+	}
+	if (psci_trampoline_pa != 0) {
+		dt_prop_u64(&w, "psci-entry-trampoline", psci_trampoline_pa);
+	}
 	/* the time now, by the firmware's clock (the kernel has no real-time clock driver) */
 	uint64_t epoch = firmware_epoch();
 	if (epoch != 0) {
@@ -3361,13 +3501,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = mpidr_core(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr = core_mpidr(plat, core);
 				int64_t state;
 
 				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
@@ -3403,7 +3543,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		if (plat->small_cores & (1u << (mpidr_core(plat, cpu_mpidr[i]) & 31))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -3427,9 +3567,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
-	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
-	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	if (gic_has_sysregs()) {
+		dt_prop_str(&w, "compatible", "arm,gic-v3");
+		uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+		dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	} else {
+		/* GICv2: distributor and CPU interface (gic_v3_irq.c's GICv2 path) */
+		dt_prop_str(&w, "compatible", "arm,gic-400");
+		uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x1000, plat->gic_cpuif - plat->io_base, 0x2000 };
+		dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	}
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
@@ -4319,6 +4466,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	/* the A51 is told by its display, before the payload is looked for: its payload is elsewhere */
+	{
+		efi_gop *gop = NULL;
+		if (!EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&gop)) && gop != NULL && gop->mode != NULL &&
+		    gop->mode->fb_base == A51_FB_BASE) {
+			payload_base = A51_PAYLOAD_BASE;
+		}
+	}
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
@@ -4345,12 +4500,17 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == A51_FB_BASE) {
+			PLAT = &platform_a51;       /* not QEMU: ramfb_phone_screen() would touch fw_cfg, which is not there */
 		} else {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	if (PLAT == &platform_a51) {
+		ufs_survey();           /* read only: what its UEFI's UFS driver sees (no kernel runs here yet to ask for it) */
+	}
 
 	install_exception_hook();
 	wdt_arm();

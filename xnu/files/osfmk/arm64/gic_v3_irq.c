@@ -23,6 +23,20 @@
  *
  * Registers come from the device tree node /arm-io/gic:
  *   reg = <distributor offset, size, redistributor offset, size>
+ *
+ * GICv2 (a GIC-400: the Samsung Galaxy A51's Exynos 9611, QEMU's virt machine with gic-version=2) is
+ * driven by the same entry points. It is chosen when the processor has no system-register CPU
+ * interface (ID_AA64PFR0_EL1.GIC == 0), and then the node's second register range is the CPU
+ * interface, not a redistributor:
+ *   reg = <distributor offset, size, CPU interface offset, size>
+ * What differs: the CPU interface is memory-mapped (GICC_IAR / GICC_EOIR / GICC_PMR / GICC_CTLR); the
+ * SGIs' and PPIs' enable, pending, active and priority registers are the distributor's, banked per
+ * processor; an SPI is routed with a byte of CPU-interface bits in GICD_ITARGETSR (no GICD_IROUTER, which
+ * would be past a GIC-400's 4 KB distributor); a signal between processors goes through GICD_SGIR, to
+ * CPU-interface numbers, which each processor learns for itself from GICD_ITARGETSR0. Groups are left as
+ * the firmware set them and only the group this side may enable is enabled (bit 0 of GICD_CTLR and
+ * GICC_CTLR), as Linux's gic driver does: with the security extensions (the phone, whose secure firmware
+ * makes the interrupts Group 1) that bit is Group 1's, without them (QEMU) it is Group 0's, signalled as IRQ.
  */
 #include <mach/mach_types.h>
 #include <kern/debug.h>
@@ -78,9 +92,28 @@
 #define GIC_SPI_MOST            48          /* attached at a time */
 #define GIC_PRIORITY_DEFAULT    0xa0
 
+/* GICv2 */
+#define GICD_ITARGETSR(n)       (0x0800 + (n))
+#define GICD_SGIR               0x0f00
+#define GICD_CTLR_ENABLE        (1u << 0)
+#define GICC_CTLR               0x0000
+#define GICC_PMR                0x0004
+#define GICC_BPR                0x0008
+#define GICC_IAR                0x000c
+#define GICC_EOIR               0x0010
+#define GICC_APR0               0x00d0
+#define GICC_CTLR_ENABLE        (1u << 0)
+#define GICV2_INTID_MASK        0x3ff
+
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
+
+/* GICv2 */
+static bool        gic_v2;
+static vm_offset_t gicc_base;               /* the CPU interface (one address, banked per processor) */
+static uint8_t     gicv2_cpu_mask[MAX_CPUS]; /* by cpu_number(): its CPU-interface bit, 0 until it has started */
+static uint32_t    gicv2_phys_id[MAX_CPUS];  /* ... and its MPIDR's two low affinity fields */
 
 /*
  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
@@ -135,6 +168,11 @@ gic_write32(vm_offset_t addr, uint32_t value)
 static void
 gic_mask(uint32_t intid)
 {
+	if (gic_v2) {
+		/* (an SGI or PPI: the processor's own bank of the same register) */
+		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
+		return;
+	}
 	if (intid < 32) {
 		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
 	} else {
@@ -151,6 +189,18 @@ gic_mask(uint32_t intid)
 static void
 gic_send_sgi(uint32_t phys_id, uint32_t sgi)
 {
+	if (gic_v2) {
+		for (unsigned i = 0; i < MAX_CPUS; i++) {
+			if (gicv2_cpu_mask[i] != 0 && gicv2_phys_id[i] == (phys_id & 0xffff)) {
+				__builtin_arm_dsb(DSB_ISHST);   /* what the signal is about is in memory first */
+				/* TargetListFilter 0 (the list), CPUTargetList [23:16], the interrupt [3:0] */
+				gic_write32(gicd_base + GICD_SGIR, ((uint32_t)gicv2_cpu_mask[i] << 16) | sgi);
+				return;
+			}
+		}
+		return;         /* a processor that has not started yet: nothing to interrupt */
+	}
+
 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
 
 	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
@@ -193,6 +243,9 @@ gic_spi_handle(uint32_t intid)
 static void
 gic_distributor_settle(void)
 {
+	if (gic_v2) {
+		return;         /* a GICv2's distributor writes take effect without a register-write-pending bit */
+	}
 	while (gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_RWP) {
 		/* wait for the change to take effect */
 	}
@@ -254,13 +307,20 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
 	gic_v3_spi_mask(intid);
 	gic_write32(gicd_base + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
 	gic_write32(gicd_base + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
-	gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
-	gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
+	if (!gic_v2) {
+		gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
+		gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
+	}
 	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = GIC_PRIORITY_DEFAULT;
 	config = gic_read32(gicd_base + GICD_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
 	gic_write32(gicd_base + GICD_ICFGR(intid / 16), config | (edge ? 2u : 0u) << (intid % 16 * 2));
-	/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
-	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
+	if (gic_v2) {
+		/* GICD_ITARGETSR: a byte of CPU-interface bits; this processor's */
+		*(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(intid)) = gicv2_cpu_mask[cpu_number()];
+	} else {
+		/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
+		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
+	}
 	gic_distributor_settle();
 	gic_v3_spi_unmask(intid);
 	return KERN_SUCCESS;
@@ -297,13 +357,33 @@ gic_v3_spi_count(uint32_t intid)
 }
 
 static void
+gic_eoi(uint64_t iar)
+{
+	if (gic_v2) {
+		gic_write32(gicc_base + GICC_EOIR, (uint32_t)iar);
+	} else {
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+		__builtin_arm_isb(ISB_SY);
+	}
+}
+
+static void
 gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
 {
 	int cpu = cpu_number();
 
 	for (;;) {
-		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
-		uint32_t intid = (uint32_t)(iar & 0xffffff);
+		uint64_t iar;
+		uint32_t intid;
+
+		if (gic_v2) {
+			/* (for an SGI the sender's CPU number is in [12:10]: GICC_EOIR wants the whole value back) */
+			iar = gic_read32(gicc_base + GICC_IAR);
+			intid = (uint32_t)(iar & GICV2_INTID_MASK);
+		} else {
+			iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+			intid = (uint32_t)(iar & 0xffffff);
+		}
 
 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
 			break;
@@ -328,8 +408,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			gic_last_unhandled = intid;
 		}
 
-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
-		__builtin_arm_isb(ISB_SY);
+		gic_eoi(iar);
 		gic_active_iar[cpu] = 0;
 	}
 }
@@ -358,8 +437,7 @@ gic_v3_irq_quiesce(void)
 		}
 	}
 	if (gic_active_iar[cpu] != 0) {
-		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
-		__builtin_arm_isb(ISB_SY);
+		gic_eoi(gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
 		gic_active_iar[cpu] = 0;
 	}
 }
@@ -382,6 +460,14 @@ gic_v3_irq_cpu_shutdown(void)
 		return;
 	}
 	gic_v3_irq_quiesce();
+	if (gic_v2) {
+		/* this processor's bank: its SGIs (a GIC-400 keeps those enabled whatever is written) and PPIs */
+		gic_write32(gicd_base + GICD_ICENABLER(0), 0xffffffffu);
+		gic_write32(gicd_base + GICD_ICPENDR(0), 0xffffffffu);
+		gic_write32(gicd_base + GICD_ICACTIVER(0), 0xffffffffu);
+		gic_write32(gicc_base + GICC_CTLR, 0);
+		return;
+	}
 	gicr = gicr_cpu_base[cpu_number()];
 	if (gicr != 0) {
 		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
@@ -412,6 +498,56 @@ gic_find_redistributor(void)
 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
 }
 
+/* GICv2 per-CPU bring-up (gic_v3_irq_cpu_init() has mapped the distributor and the CPU interface). */
+static void
+gic_v2_irq_cpu_init(int cpu)
+{
+	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint8_t  mask;
+
+	if (gicv2_cpu_mask[cpu] != 0) {
+		return;
+	}
+	/*
+	 * GICD_ITARGETSR0..7 read as this processor's own CPU-interface bit in every byte. A uniprocessor
+	 * GIC may read them as zero: it has one interface, interface 0.
+	 */
+	mask = (uint8_t)(gic_read32(gicd_base + GICD_ITARGETSR(0)) & 0xff);
+	if (mask == 0) {
+		mask = 1;
+	}
+	gicv2_phys_id[cpu] = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
+	gicv2_cpu_mask[cpu] = mask;
+
+	if (ml_get_cpu_count() > 1) {
+		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
+
+		/* as in the GICv3 path: nothing left active or pending from an earlier kernel on this core */
+		gic_write32(gicd_base + GICD_ICACTIVER(0), sgis);
+		gic_write32(gicd_base + GICD_ICPENDR(0), sgis);
+		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
+		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
+		mine |= sgis;
+	}
+
+	/* Virtual timer PPI (and those): default priority, enabled, in this processor's bank */
+	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	gic_write32(gicd_base + GICD_ISENABLER(0), mine);
+
+	/* Distributor on (normally already so) */
+	gic_write32(gicd_base + GICD_CTLR, gic_read32(gicd_base + GICD_CTLR) | GICD_CTLR_ENABLE);
+
+	/* CPU interface: no priority active, all priorities let through, no preemption grouping, on */
+	gic_write32(gicc_base + GICC_APR0, 0);
+	gic_write32(gicc_base + GICC_PMR, 0xff);
+	gic_write32(gicc_base + GICC_BPR, 0);
+	gic_write32(gicc_base + GICC_CTLR, GICC_CTLR_ENABLE);
+
+	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
+	kprintf("gic: v2, distributor %p, CPU interface %p, cpu %d is interface bit 0x%x, virtual timer on PPI %d\n",
+	    (void *)gicd_base, (void *)gicc_base, cpu, mask, GIC_INTID_VTIMER);
+}
+
 /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
 void
 gic_v3_irq_cpu_init(void)
@@ -434,13 +570,28 @@ gic_v3_irq_cpu_init(void)
 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
 		simple_lock_init(&gic_spi_lock, 0);
-		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
-		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
-		gicr_size = reg[3];
-		if (gicd_base == 0 || gicr_base == 0) {
-			panic("gic: cannot map the distributor/redistributor");
+		/* no system-register CPU interface: a GICv2, and reg's second range is its CPU interface */
+		gic_v2 = ((__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf) == 0;
+		if (gic_v2) {
+			gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
+			gicc_base = ml_io_map(soc_base + reg[2], reg[3]);
+			if (gicd_base == 0 || gicc_base == 0) {
+				panic("gic: cannot map the GICv2 distributor/CPU interface");
+			}
+		} else {
+			gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
+			gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
+			gicr_size = reg[3];
+			if (gicd_base == 0 || gicr_base == 0) {
+				panic("gic: cannot map the distributor/redistributor");
+			}
 		}
-	} else if (gicr_cpu_base[cpu] != 0) {
+	} else if (gic_v2 ? gicv2_cpu_mask[cpu] != 0 : gicr_cpu_base[cpu] != 0) {
+		return;
+	}
+
+	if (gic_v2) {
+		gic_v2_irq_cpu_init(cpu);
 		return;
 	}
 

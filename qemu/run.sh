@@ -7,6 +7,9 @@
 #                           its boot-arg cpus=N says (CMDLINE="cpus=4" for run-darwin.sh), one without it
 #      QEMU_ESP=1           no loader device: the payload is the file \EFI\hakios\payload.bin on the ESP, which the loader
 #                           reads itself (UEFI-native boot; what a boot menu or a USB stick does)
+#      QEMU_GIC=2           a GICv2 (GIC-400, what the Galaxy A51 has) instead of the default GICv3; the cores then
+#                           have no GIC system registers, which is how the loader and the kernel tell
+#      QEMU_CPU             the core QEMU emulates (default cortex-a76); cortex-a53 is the Galaxy A51's (ARMv8.0)
 #      QEMU_EFI, QEMU_VARS  the UEFI firmware for aarch64 guests (found by itself where Arch's edk2-aarch64
 #                           puts it, or Debian/Ubuntu's /usr/share/AAVMF/AAVMF_CODE.fd and AAVMF_VARS.fd)
 cd "$(dirname "$0")"
@@ -34,7 +37,7 @@ if [ -n "${QEMU_ESP:-}" ]; then
 	mkdir -p esp/EFI/hakios && cp payload.bin esp/EFI/hakios/payload.bin
 	PAYLOAD_DEVICE=()
 fi
-timeout "$T" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a76 -smp ${QEMU_SMP:-1} -m ${QEMU_MEM:-6G} \
+timeout "$T" qemu-system-aarch64 -M virt,gic-version=${QEMU_GIC:-3} -cpu ${QEMU_CPU:-cortex-a76} -smp ${QEMU_SMP:-1} -m ${QEMU_MEM:-6G} \
   -accel tcg,tb-size=${QEMU_TB_MB:-384} \
   -drive if=pflash,format=raw,readonly=on,file="$EFI" \
   -drive if=pflash,format=raw,file=vars.fd \

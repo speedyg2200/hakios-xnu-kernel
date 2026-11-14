@@ -128,8 +128,18 @@ def _lzfse_decompress(src, out_len):
     try:
         import lzfse
     except ImportError:
-        raise SystemExit("dmg.py: this image uses LZFSE chunks; install the python "
-                         "'lzfse' module (pip install lzfse)")
+        # no module: the reference decoder built by xnuloader/mkidentity.sh, one chunk per call
+        import os, shutil, subprocess
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'xnu-deps', 'host', 'bin', 'lzfse')
+        if not os.access(tool, os.X_OK):
+            tool = shutil.which('lzfse')
+        if tool is None:
+            raise SystemExit("dmg.py: this image uses LZFSE chunks; install the python "
+                             "'lzfse' module (pip install lzfse), or build xnu-deps/host/bin/lzfse")
+        r = subprocess.run([tool, '-decode'], input=src, capture_output=True)
+        if r.returncode != 0:
+            raise SystemExit("dmg.py: lzfse -decode failed: " + r.stderr.decode(errors='replace'))
+        return r.stdout[:out_len]
     return lzfse.decompress(src)[:out_len]
 
 

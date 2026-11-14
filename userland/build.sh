@@ -553,8 +553,10 @@ done
 # Programs and libraries of more than 4 MB (Turnip, UniXNU's Metal on Vulkan: TURNIP=1, M2V=1) live in the system
 # image, in /usr/local/redwood, with a link in their place here: the small image is loaded with the kernel, in the
 # 64 MB the loader takes for both (with them it grew from 6.6 to 26 MB).
+# Not with FLASHBOOT=1: a boot off the flash has no system image (its root is Apple's volume), so the link would point
+# nowhere; there they stay here (GL=test on the Galaxy A51: Mesa's 15 MB, about 6 MB in the image with zlib).
 rm -rf big
-for f in $(cd root && find lib bin -type f -size +4M 2>/dev/null); do
+for f in $([ -z "$FLASHBOOT" ] && cd root && find lib bin -type f -size +4M 2>/dev/null); do
 	mkdir -p big/$(dirname $f)
 	mv root/$f big/$f
 	ln -s /usr/local/redwood/$f root/$f

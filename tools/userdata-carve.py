@@ -137,8 +137,13 @@ def main():
     if len(ud) != 1:
         sys.exit('userdata-carve.py: not exactly one partition named userdata')
     u = ud[0]
-    if any(entries[i]['last'] > entries[u]['last'] for i in used) or entries[u]['last'] != ph['last_usable']:
+    # Samsung leaves alignment slack between userdata and the backup table (the Galaxy A51: 251 blocks); NAME ends
+    # at last_usable whatever userdata did, so up to 2 MB of nothing there is taken in with it
+    slack = ph['last_usable'] - entries[u]['last']
+    if any(entries[i]['last'] > entries[u]['last'] for i in used) or not 0 <= slack < 2 * 2**20 // BS:
         sys.exit('userdata-carve.py: userdata is not the last partition, reaching to the end of the unit')
+    if slack:
+        print(f'userdata ends {slack} blocks before the last usable one: those go to the new partition')
     if any(e['name'] == name for e in entries):
         sys.exit(f'userdata-carve.py: there is a partition named {name} already')
     free = [i for i, e in enumerate(entries) if e['type'].int == 0]

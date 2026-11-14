@@ -64,6 +64,14 @@ extern unsigned long gVirtBase, gPhysBase;
 
 /* The firmware is called with HVC, not SMC. (start.s reads this too, at its physical address.) */
 uint32_t psci_smp_hvc;
+/*
+ * /chosen/psci-entry-trampoline: where the firmware takes only entry points below 4 GB (the Galaxy A51's), the boot
+ * loader leaves "ldr x9, slot; br x9" and an 8-byte slot below 4 GB. The entry goes into the slot, written through an
+ * uncached mapping (so that it is in memory, where the new core reads it), and CPU_ON is given the trampoline.
+ */
+static uint64_t    psci_trampoline_pa;
+static vm_offset_t psci_trampoline_va;
+#define PSCI_TRAMPOLINE_SLOT    8
 
 /*
  * Left by a core that took an exception between its first instruction and the kernel's vectors
@@ -123,6 +131,10 @@ psci_smp_init(void)
 	    SecureDTGetProperty(chosen, "psci-method", &prop, &size) == kSuccess &&
 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
 		psci_smp_hvc = 1;
+	}
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "psci-entry-trampoline", &prop, &size) == kSuccess && size == sizeof(uint64_t)) {
+		psci_trampoline_pa = *(uint64_t const *)prop;
 	}
 }
 
@@ -185,8 +197,19 @@ psci_smp_start_cpu(int cpu)
 	}
 	__builtin_arm_dsb(DSB_SY);
 
+	uint64_t firmware_entry = entry;
+	if (psci_trampoline_pa != 0) {
+		if (psci_trampoline_va == 0) {
+			psci_trampoline_va = ml_io_map(psci_trampoline_pa & ~(uint64_t)PAGE_MASK, PAGE_SIZE) +
+			    (psci_trampoline_pa & PAGE_MASK);
+		}
+		*(volatile uint64_t *)(psci_trampoline_va + PSCI_TRAMPOLINE_SLOT) = entry;
+		__builtin_arm_dsb(DSB_SY);
+		firmware_entry = psci_trampoline_pa;
+	}
+
 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
-	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	status = psci_call(PSCI_CPU_ON, phys_id, firmware_entry, 0);
 	if (status != 0) {
 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
 		printf("psci: cpu %d (MPIDR 0x%x) was not started: the firmware answers %lld (%s)\n",

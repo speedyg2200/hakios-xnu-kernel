@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 
 /* GL/osmesa.h and GLES2/gl2.h of Mesa, as far as they are used here */
 typedef struct osmesa_context *OSMesaContext;
@@ -245,6 +248,47 @@ fill(int width, int height)
 	printf("gl_test: fill: error %#x\n", glGetError());
 }
 
+/*
+ * A crash said where it happened: the fault address, pc and lr, and the frames by their frame pointers, each as an
+ * offset into its image, to be looked up on the build machine in the unstripped library (Mesa's out/ copy is stripped
+ * of its local symbols; the one in the build directory, src/gallium/targets/osmesa, is not).
+ */
+static void
+said(const char *what, uintptr_t address)
+{
+	Dl_info info;
+
+	if (address != 0 && dladdr((void *)address, &info) && info.dli_fname != NULL) {
+		const char *name = strrchr(info.dli_fname, '/');
+		printf("gl_test: crash: %-4s %#lx = %s+%#lx (%s)\n", what, (unsigned long)address, name ? name + 1 : info.dli_fname,
+		    (unsigned long)(address - (uintptr_t)info.dli_fbase), info.dli_sname ? info.dli_sname : "?");
+	} else {
+		printf("gl_test: crash: %-4s %#lx\n", what, (unsigned long)address);
+	}
+}
+
+static void
+crashed(int signal, siginfo_t *info, void *context)
+{
+	ucontext_t *uc = context;
+	uintptr_t fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+
+	printf("gl_test: crash: signal %d at address %p\n", signal, info->si_addr);
+	said("pc", (uintptr_t)uc->uc_mcontext->__ss.__pc);
+	said("lr", (uintptr_t)uc->uc_mcontext->__ss.__lr);
+	for (int i = 0; i < 24 && fp != 0 && (fp & 7) == 0; i++) {
+		uintptr_t *frame = (uintptr_t *)fp;
+
+		said("ret", frame[1]);
+		if (frame[0] <= fp) {
+			break;
+		}
+		fp = frame[0];
+	}
+	fflush(stdout);
+	_exit(128 + signal);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -267,6 +311,12 @@ main(int argc, char **argv)
 	OSMesaContext context;
 	int good = 0;
 
+	{
+		struct sigaction action = { .sa_sigaction = crashed, .sa_flags = SA_SIGINFO };
+
+		sigaction(SIGSEGV, &action, NULL);
+		sigaction(SIGBUS, &action, NULL);
+	}
 	context = OSMesaCreateContextAttribs(attributes, NULL);
 	if (context == NULL || !OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
 		printf("gl_test: no OpenGL ES context\n");

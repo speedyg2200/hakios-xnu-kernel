@@ -8,6 +8,7 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/time.h>
@@ -20,13 +21,17 @@
 
 #include "xf86drm.h"
 #include "drm-uapi/msm_drm.h"
+#include "drm-uapi/panfrost_drm.h"
 
 #define HAKIOS_GPU_SERVICE     "HakiosGPU"
+#define HAKIOS_MALI_SERVICE    "HakiosMali"    /* the Galaxy A51's Mali: Linux's panfrost interface, 1.1 */
+#define HAKIOS_MALI_WAIT_FENCE 0x7b            /* HakiosMali's own: wait for a submission's fence */
 #define HAKIOS_GPU_USER_MEMORY 0x7d            /* ours too: pages of this process as a buffer */
 #define HAKIOS_GPU_SURFACE     0x7e            /* the request that is not Linux's */
 #define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 
 static io_connect_t connection;
+static bool panfrost;                           /* which of the two the connection is to */
 static int connection_fd = -1;
 
 int
@@ -36,13 +41,14 @@ drmOpenWithType(const char *name, const char *busid, int type)
 
 	(void)busid;
 	(void)type;
-	if (strcmp(name, "msm") != 0) {
+	if (strcmp(name, "msm") != 0 && strcmp(name, "panfrost") != 0) {
 		return -1;
 	}
 	if (connection_fd >= 0) {
-		return dup(connection_fd);
+		return panfrost == (strcmp(name, "panfrost") == 0) ? dup(connection_fd) : -1;
 	}
-	service = IOServiceGetMatchingService(0, IOServiceMatching(HAKIOS_GPU_SERVICE));
+	panfrost = strcmp(name, "panfrost") == 0;
+	service = IOServiceGetMatchingService(0, IOServiceMatching(panfrost ? HAKIOS_MALI_SERVICE : HAKIOS_GPU_SERVICE));
 	if (service == 0) {
 		return -1;
 	}
@@ -81,10 +87,18 @@ call(unsigned number, void *data, size_t size)
 	}
 }
 
+static int panfrost_submit(struct drm_panfrost_submit *submit);
+
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
-	int error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+	int error;
+
+	if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT) {
+		error = -panfrost_submit(arg);
+	} else {
+		error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+	}
 
 	(void)fd;
 	if (error != 0) {
@@ -125,11 +139,11 @@ drmGetVersion(int fd)
 	(void)fd;
 	if (version != NULL) {
 		version->version_major = 1;
-		version->version_minor = 7;
-		version->name = strdup("msm");
-		version->name_len = 3;
+		version->version_minor = panfrost ? 1 : 7;     /* panfrost 1.1: heaps that grow, MADVISE; no timestamps */
+		version->name = strdup(panfrost ? "panfrost" : "msm");
+		version->name_len = (int)strlen(version->name);
 		version->date = strdup("");
-		version->desc = strdup("Adreno on Darwin");
+		version->desc = strdup(panfrost ? "Mali on Darwin" : "Adreno on Darwin");
 		version->desc_len = (int)strlen(version->desc);
 	}
 	return version;
@@ -226,10 +240,6 @@ NONE(drmSyncobjFDToHandle, __attribute__((unused)) int fd, __attribute__((unused
     __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjHandleToFD, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
     __attribute__((unused)) int *obj_fd)
-NONE(drmSyncobjImportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) int sync_file_fd)
-NONE(drmSyncobjExportSyncFile, __attribute__((unused)) int fd, __attribute__((unused)) uint32_t handle,
-    __attribute__((unused)) int *sync_file_fd)
 
 /*
  * DRM's synchronisation objects (syncobj), which Turnip's msm backend makes its VkFences and VkSemaphores of, kept in
@@ -263,6 +273,11 @@ syncobj_of(uint32_t handle)
 static bool
 fence_done(uint32_t fence, int64_t deadline)
 {
+	if (panfrost) {
+		struct { uint32_t fence, completed; int64_t timeout_ns; } mali = { fence, 0, deadline };
+
+		return call(HAKIOS_MALI_WAIT_FENCE, &mali, sizeof(mali)) == 0 && (int32_t)(mali.completed - fence) >= 0;
+	}
 	struct drm_msm_wait_fence wait = { .fence = fence, .queueid = 0 };
 
 	wait.timeout.tv_sec = deadline / 1000000000;
@@ -311,6 +326,83 @@ syncobj_add(struct syncobj *s, uint64_t point, uint32_t fence)
 	s->on_the_way[s->pending].point = point;
 	s->on_the_way[s->pending].fence = fence;
 	s->pending++;
+}
+
+/*
+ * Sync files: what Panfrost makes its GL fences of (pan_fence.c: the context's syncobj exported as a sync file, imported
+ * again into a syncobj of the fence's own). On Linux a file of the kernel's; here, where nothing outside this process
+ * waits for one, a descriptor of /dev/null that stands for the submission its syncobj was waiting for when exported (0:
+ * none, it is signalled). A descriptor not made here is taken for a signalled one.
+ */
+#define SYNC_FILES      4096
+static struct { bool made; uint32_t fence; } sync_files[SYNC_FILES];
+
+int
+drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+	uint32_t fence = 0;
+	int file;
+
+	(void)fd;
+	pthread_mutex_lock(&syncobj_lock);
+	struct syncobj *s = syncobj_of(handle);
+	if (s == NULL) {
+		pthread_mutex_unlock(&syncobj_lock);
+		errno = ENOENT;
+		return -1;
+	}
+	syncobj_poll(s);
+	if (s->reached == 0 && s->pending == 0) {
+		pthread_mutex_unlock(&syncobj_lock);
+		errno = EINVAL;                 /* (Linux too: no fence to export) */
+		return -1;
+	}
+	if (s->reached == 0) {
+		fence = s->on_the_way[s->pending - 1].fence;
+	}
+	pthread_mutex_unlock(&syncobj_lock);
+	file = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (file < 0) {
+		return -1;
+	}
+	if (file >= SYNC_FILES) {
+		/* (more sync files open than expected: this one waits for its fence now, and stands for a signalled one) */
+		fence_done(fence, now_ns() + 10000000000LL);
+		fence = 0;
+	} else {
+		sync_files[file].made = true;
+		sync_files[file].fence = fence;
+	}
+	*sync_file_fd = file;
+	return 0;
+}
+
+int
+drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+	uint32_t fence = 0;
+
+	(void)fd;
+	if (sync_file_fd >= 0 && sync_file_fd < SYNC_FILES && sync_files[sync_file_fd].made) {
+		fence = sync_files[sync_file_fd].fence;
+	}
+	pthread_mutex_lock(&syncobj_lock);
+	struct syncobj *s = syncobj_of(handle);
+	if (s == NULL) {
+		pthread_mutex_unlock(&syncobj_lock);
+		errno = ENOENT;
+		return -1;
+	}
+	s->pending = 0;
+	if (fence == 0) {
+		s->reached = 1;
+	} else {
+		s->reached = 0;
+		syncobj_add(s, 1, fence);
+	}
+	pthread_cond_broadcast(&syncobj_submitted);
+	pthread_mutex_unlock(&syncobj_lock);
+	return 0;
 }
 
 int
@@ -569,6 +661,50 @@ submit_with_syncobjs(struct drm_msm_gem_submit *submit, unsigned long size)
 	pthread_cond_broadcast(&syncobj_submitted);
 	pthread_mutex_unlock(&syncobj_lock);
 	return 0;
+}
+
+/*
+ * Panfrost's SUBMIT: its in_syncs waited for here, the chain to the kernel, which answers its fence in out_sync (not
+ * Linux's), and the out_sync syncobj made to stand for that fence. Panfrost's syncobjs are binary.
+ */
+static int
+panfrost_submit(struct drm_panfrost_submit *submit)
+{
+	const uint32_t *in = (const uint32_t *)(uintptr_t)submit->in_syncs;
+	uint32_t out = submit->out_sync;
+	int error;
+
+	for (uint32_t i = 0; i < submit->in_sync_count; i++) {
+		uint32_t h = in[i];
+		int r = drmSyncobjWait(0, &h, 1, now_ns() + 10000000000LL,
+		    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+		if (r != 0) return r;
+	}
+	submit->in_syncs = 0;
+	submit->in_sync_count = 0;
+	error = call((unsigned)(DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT), submit, sizeof(*submit));
+	if (error != 0) return -error;
+	uint32_t fence = submit->out_sync;
+	submit->out_sync = out;
+	__atomic_store_n(&last_fence, fence, __ATOMIC_RELEASE);
+	pthread_mutex_lock(&syncobj_lock);
+	struct syncobj *s = syncobj_of(out);
+	if (s != NULL) {
+		s->reached = 0;
+		s->pending = 0;
+		syncobj_add(s, 1, fence);
+	}
+	pthread_cond_broadcast(&syncobj_submitted);
+	pthread_mutex_unlock(&syncobj_lock);
+	return 0;
+}
+
+int
+drmCloseBufferHandle(int fd, uint32_t handle)
+{
+	struct drm_gem_close request = { .handle = handle };
+
+	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
 }
 
 /* Linux's device nodes, which Turnip's lists of devices ask about: one GPU, a render node 128 */

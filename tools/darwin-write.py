@@ -9,6 +9,10 @@ usage:
   darwin-write.py zero  BLOCK COUNT     with DARWIN_WRITE=yes: zeros over COUNT blocks, read back and compared
   darwin-write.py selftest              the refusals, against this tool's own checks and a GPT read now (writes nothing)
 
+  darwin-write.py install-system IMAGE  with DARWIN_WRITE=yes and DARWIN_SYSTEM=yes: the whole system region (the Darwin
+                                        volume and both cryptexes, blocks 0..2042367, exactly that size) at block 0,
+                                        read back and compared. For a phone that has no fastboot to flash it with.
+DARWIN_DEVICE=a51 takes the Samsung Galaxy A51's darwin (sda33) instead of the POCO X5 Pro's (sda34, the default).
 Blocks are darwin's own, 4096 bytes, counted from the partition's start. What it takes to write:
 
   - darwin is what it was when the port was set up, read at the time of the write and compared with the
@@ -36,16 +40,30 @@ import uuid
 
 NAME = 'darwin'
 TYPE = '7C3457EF-0000-11AA-AA11-00306543ECAC'          # Apple APFS
-UNIQUE = 'FD6854AD-24AA-4FC3-94FE-290116858D68'
 LUN = 0
-PARTN = 34
-FIRST = 25374720
-LAST = 30617594
+# each phone's darwin as tools/userdata-carve.py made it (its unique GUID is new on every phone)
+DEVICES = {
+    'redwood': dict(unique='FD6854AD-24AA-4FC3-94FE-290116858D68', partn=34, first=25374720, last=30617594,
+                    gpt_blocks=3, ufs='ufshc'),          # header + 64 entries (LBA 1..3); Qualcomm's ufshc
+    # Galaxy A51 (SM-A515F), carved 2026-11-13 with --wipe 20 (a51-dump/carve/gpt-head.after)
+    'a51': dict(unique='A3873ACD-F3A5-4C12-8020-5F7A8ACA8C37', partn=33, first=25992704, last=31236090,
+                gpt_blocks=5, ufs='13520000.ufs'),       # header + 128 entries (LBA 1..5); the 9611's exynos-ufs
+}
+DEVICE = os.environ.get('DARWIN_DEVICE', 'redwood')
+if DEVICE not in DEVICES:
+    sys.exit('darwin-write: DARWIN_DEVICE=%s is none of %s' % (DEVICE, ', '.join(sorted(DEVICES))))
+UNIQUE = DEVICES[DEVICE]['unique']
+PARTN = DEVICES[DEVICE]['partn']
+FIRST = DEVICES[DEVICE]['first']
+LAST = DEVICES[DEVICE]['last']
+GPT_BLOCKS = DEVICES[DEVICE]['gpt_blocks']             # the GPT header and its table, from LBA 1
+UFS_SYSFS = DEVICES[DEVICE]['ufs']                     # what sda's device path names its UFS controller
 BS = 4096
-BLOCKS = LAST - FIRST + 1                               # 5242875
-PROTECTED = 1374208                                     # rootfs.apfs: 5628755968 bytes, never written
+BLOCKS = LAST - FIRST + 1                               # redwood 5242875, a51 5243387
+PROTECTED = 1374208                                     # rootfs.apfs: 5628755968 bytes, never written (but by install-system)
+SYSTEM = 2042368                                        # rootfs.apfs + OS cryptex + App cryptex: the system region
 DEV = '/dev/block/by-name/darwin'
-NODE = '/dev/block/sda34'
+NODE = '/dev/block/sda%d' % PARTN
 TMP = '/data/local/tmp/darwin-write.img'
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -142,12 +160,12 @@ echo "ss=$(blockdev --getss /dev/block/sda)"
         if facts.get(k) != v:
             bad.append('%s is %r, not %r' % (k, facts.get(k), v))
     lun = facts.get('lun', '')
-    if 'ufshc' not in lun or not lun.endswith(':%d' % LUN):
+    if UFS_SYSFS not in lun or not lun.endswith(':%d' % LUN):
         bad.append('sda is %r, not logical unit %d of the UFS controller' % (lun, LUN))
     # the GPT: LBA 1 (header) and the table after it (64 entries of 128 bytes: LBA 2..3)
-    raw = phone_bytes('dd if=/dev/block/sda bs=%d skip=1 count=3 2>/dev/null' % BS)
-    if len(raw) != 3 * BS:
-        bad.append('read %d bytes of the GPT, not %d' % (len(raw), 3 * BS))
+    raw = phone_bytes('dd if=/dev/block/sda bs=%d skip=1 count=%d 2>/dev/null' % (BS, GPT_BLOCKS))
+    if len(raw) != GPT_BLOCKS * BS:
+        bad.append('read %d bytes of the GPT, not %d' % (len(raw), GPT_BLOCKS * BS))
     else:
         bad += check_gpt(raw)
     if bad:
@@ -211,17 +229,25 @@ def guarded(command):
             % {'dev': DEV, 'node': NODE, 'bytes': BLOCKS * BS, 'cmd': command})
 
 
-def prepare(image, block):
+def prepare(image, block, system=False):
     size = os.path.getsize(image)
     if size % BS:
         raise Refused('%s is %d bytes, not whole blocks of %d' % (image, size, BS))
     count = size // BS
+    if system:
+        # the one way into the Darwin volume: all of the system region at once, from its first block
+        if block != 0 or count != SYSTEM:
+            raise Refused('install-system takes exactly the system region: %d blocks at block 0, not %d at %d'
+                          % (SYSTEM, count, block))
+        if SYSTEM > BLOCKS:
+            raise Refused('the system region (%d blocks) is bigger than darwin (%d)' % (SYSTEM, BLOCKS))
+        return count
     blocks_ok(block, count)
     return count
 
 
-def cmd_plan(image, block, write=False):
-    count = prepare(image, block)
+def cmd_plan(image, block, write=False, system=False):
+    count = prepare(image, block, system)
     who = identity()
     digest = sha256_file(image)
     dd = 'dd if=%s of=%s bs=%d seek=%d count=%d conv=notrunc,fsync' % (TMP, DEV, BS, block, count)
@@ -232,6 +258,8 @@ def cmd_plan(image, block, write=False):
         return
     if os.environ.get('DARWIN_WRITE') != 'yes':
         raise Refused('DARWIN_WRITE=yes is not set: nothing written')
+    if system and os.environ.get('DARWIN_SYSTEM') != 'yes':
+        raise Refused('DARWIN_SYSTEM=yes is not set: the Darwin volume is not written')
     r = subprocess.run(['adb', 'push', image, TMP], capture_output=True, text=True)
     if r.returncode != 0:
         raise Refused('adb push: ' + r.stderr.strip())
@@ -285,7 +313,7 @@ def cmd_selftest():
             log('selftest: block %r was NOT refused' % s)
         except Refused as e:
             log('selftest: block %r refused: %s' % (s, e))
-    raw = phone_bytes('dd if=/dev/block/sda bs=%d skip=1 count=3 2>/dev/null' % BS)
+    raw = phone_bytes('dd if=/dev/block/sda bs=%d skip=1 count=%d 2>/dev/null' % (BS, GPT_BLOCKS))
     log('selftest: the GPT read now: %s' % ('; '.join(check_gpt(raw)) or 'darwin as it was'))
     ok &= not check_gpt(raw)
     # the same GPT changed in one place at a time: each must be refused
@@ -331,6 +359,10 @@ def main():
                                                                             sha256_zeros(count * BS)))
         elif len(a) == 3 and a[0] in ('plan', 'write'):
             cmd_plan(a[1], number(a[2]), write=(a[0] == 'write'))
+        elif len(a) == 2 and a[0] == 'install-system':
+            cmd_plan(a[1], 0, write=True, system=True)
+        elif len(a) == 3 and a[0] == 'plan-system':
+            cmd_plan(a[1], number(a[2]), write=False, system=True)
         elif len(a) == 3 and a[0] == 'zero':
             cmd_zero(number(a[1]), number(a[2]))
         elif a == ['selftest']:

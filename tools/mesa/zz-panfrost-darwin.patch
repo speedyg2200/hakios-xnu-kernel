@@ -1,0 +1,149 @@
+Panfrost on Darwin (the Galaxy A51's Mali through HakiosMali): libdrm's stand-in, mapping by handle, and OSMesa's Mali screen.
+Named to sort last: its meson.build hunk is on top of turnip-darwin.patch.
+
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build	2026-11-13 21:06:22.637395360 +0200
++++ b/meson.build	2026-11-13 21:07:19.638605032 +0200
+@@ -1716,7 +1716,7 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_freedreno_vk)
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_freedreno_vk or with_gallium_panfrost)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/hakios-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+   # source file is built with freedreno's drm layer, src/freedreno/drm).
+diff -ruN a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
+--- a/src/gallium/targets/osmesa/meson.build	2026-11-13 21:06:22.631148831 +0200
++++ b/src/gallium/targets/osmesa/meson.build	2026-11-13 21:07:42.625027468 +0200
+@@ -39,7 +39,7 @@
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
+-    driver_freedreno, idep_xmlconfig, dep_libdrm,
++    driver_freedreno, driver_panfrost, idep_xmlconfig, dep_libdrm,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+diff -ruN a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+--- a/src/gallium/targets/osmesa/osmesa_target.c	2026-11-13 21:06:22.631211923 +0200
++++ b/src/gallium/targets/osmesa/osmesa_target.c	2026-11-13 21:07:42.625067145 +0200
+@@ -30,13 +30,48 @@
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
+ 
+-#ifdef GALLIUM_FREEDRENO
+-#include "freedreno/drm/freedreno_drm_public.h"
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+ #include "util/driconf.h"
+ #include "util/xmlconfig.h"
+ #include <xf86drm.h>
+ 
+ static int gpu_fd = -1;
++#endif
++
++#ifdef GALLIUM_PANFROST
++#include "panfrost/drm/panfrost_drm_public.h"
++
++static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++};
++
++/* The Mali's driver, where the kernel has one to drive (Darwin on the Galaxy A51: HakiosMali); NULL: none. */
++static struct pipe_screen *
++osmesa_create_panfrost_screen(void)
++{
++   static driOptionCache info, cache;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   int fd;
++
++   if (debug_get_bool_option("OSMESA_SOFTWARE", false))
++      return NULL;
++   fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
++   if (fd < 0)
++      return NULL;
++   driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
++   driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++   screen = panfrost_drm_screen_create_renderonly(fd, NULL, &config);
++   if (screen)
++      gpu_fd = fd;
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
++#endif
++
++#ifdef GALLIUM_FREEDRENO
++#include "freedreno/drm/freedreno_drm_public.h"
+ 
+ static const driOptionDescription freedreno_options[] = {
+ #include "freedreno/driinfo_freedreno.h"
+@@ -123,6 +158,11 @@
+    if (screen)
+       return screen;
+ #endif
++#ifdef GALLIUM_PANFROST
++   screen = osmesa_create_panfrost_screen();
++   if (screen)
++      return screen;
++#endif
+ 
+    /* We use a null software winsys since we always just render to ordinary
+     * driver resources.
+diff -ruN a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+--- a/src/panfrost/lib/kmod/meson.build	2025-05-28 18:20:23.000000000 +0300
++++ b/src/panfrost/lib/kmod/meson.build	2026-11-13 21:07:42.624920420 +0200
+@@ -6,6 +6,10 @@
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
+ )
++if host_machine.system() == 'darwin' and not with_gallium_freedreno
++  # the stand-in for libdrm (src/hakios-drm); with freedreno built too, its drm layer has it already
++  libpankmod_lib_files += files('../../../hakios-drm/hakios.drm.c')
++endif
+ 
+ libpankmod_lib = static_library(
+   'pankmod_lib',
+diff -ruN a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+--- a/src/panfrost/lib/kmod/pan_kmod.h	2025-05-28 18:20:23.000000000 +0300
++++ b/src/panfrost/lib/kmod/pan_kmod.h	2026-11-13 21:07:42.625001346 +0200
+@@ -615,8 +615,19 @@
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* no mmap() on a device here: the kernel's driver maps the buffer, by its handle (src/hakios-drm) */
++   (void)prot;
++   (void)flags;
++   host_addr = hakios_drm_map(bo->dev->fd, bo->handle, bo->size);
++   if (host_addr != NULL && host_addr != MAP_FAILED)
++      host_addr = (char *)host_addr + bo_offset;
++   else
++      host_addr = MAP_FAILED;
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
+--- a/src/gallium/drivers/panfrost/pan_bo.c	2026-11-14 11:39:48.086506836 +0200
++++ b/src/gallium/drivers/panfrost/pan_bo.c	2026-11-14 11:39:48.097906425 +0200
+@@ -355,10 +355,16 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   /* the mapping is IOKit's (src/hakios-drm): munmap() would leave IOKit thinking it is still there, and the next
++    * mapping of this buffer -- from Mesa's cache of buffers -- would be given the address that no longer is */
++   hakios_drm_unmap(panfrost_device_fd(bo->dev), bo->kmod_bo->handle, (void *)(uintptr_t)bo->ptr.cpu);
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }
