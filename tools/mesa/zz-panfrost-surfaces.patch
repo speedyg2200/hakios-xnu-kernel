@@ -1,0 +1,31 @@
+Panfrost on Darwin, part two: IOSurfaces as textures and render targets (the window server on the Galaxy A51's Mali).
+After zz-panfrost-darwin.patch.
+
+diff -ruN a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+--- a/src/gallium/targets/osmesa/osmesa_target.c	2026-11-14 12:04:08.475294274 +0200
++++ b/src/gallium/targets/osmesa/osmesa_target.c	2026-11-14 12:04:08.573329345 +0200
+@@ -114,7 +114,7 @@
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+ {
+-#ifdef GALLIUM_FREEDRENO
++#if defined(GALLIUM_FREEDRENO) || defined(GALLIUM_PANFROST)
+    struct hakios_drm_surface s = { .surface = surface };
+    struct pipe_resource templ = {
+       .target = PIPE_TEXTURE_2D,
+diff -ruN a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+--- a/src/panfrost/lib/kmod/pan_kmod.c	2026-11-14 12:04:08.521407803 +0200
++++ b/src/panfrost/lib/kmod/pan_kmod.c	2026-11-14 12:04:08.573444056 +0200
+@@ -176,7 +176,12 @@
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
++#ifdef __APPLE__
++      /* "fd" is an IOSurface's ID here (src/hakios-drm, as freedreno's): its size is the kernel's to say */
++      size_t size = hakios_drm_import_size(dev->fd, fd);
++#else
+       size_t size = lseek(fd, 0, SEEK_END);
++#endif
+       if (size == 0 || size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;

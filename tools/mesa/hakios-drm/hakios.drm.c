@@ -210,6 +210,16 @@ hakios_drm_surface(int fd, struct hakios_drm_surface *surface)
 	return 0;
 }
 
+/* The size of the buffer an IOSurface would be (Panfrost asks lseek() of a dma-buf's descriptor for it): 0 when not known. */
+size_t
+hakios_drm_import_size(int fd, int surface)
+{
+	struct hakios_drm_surface request = { .surface = (uint32_t)surface, .handle = HAKIOS_GPU_DESCRIBE };
+
+	(void)fd;
+	return call(HAKIOS_GPU_SURFACE, &request, sizeof(request)) == 0 ? (size_t)request.size : 0;
+}
+
 int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {

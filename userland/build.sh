@@ -473,6 +473,12 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# the Galaxy A51's ACPM plugins (exynos9610_acpm_fvp.fw, _tmu.fw: Samsung's, from its kernel's firmware/; never in the
+# repository): the GPU's clock steps (devices/a51 hakios.a51gpu.c, a51gpu_clock=N) upload them into the power firmware
+if [ -d ../fw-acpm ]; then
+	mkdir -p root/fw
+	cp ../fw-acpm/*.fw root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)

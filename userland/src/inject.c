@@ -1026,7 +1026,8 @@ container_manager_fixes(void)
  * An OpenGL ES implementation for CoreAnimation (src/eagl.c, Mesa behind it): loaded, it puts
  * itself behind EAGLContext, and the renderer the server then gets is the OpenGL ES one. That
  * is worth it where a GPU does the drawing, and only there: on the phone, when the kernel has
- * started the GPU and keeps it (boot-arg gpu=1), which the service HakiosGPU says (it is there
+ * started the GPU and keeps it (boot-arg gpu=1; on the Galaxy A51 a51gpu=8 a51gpu_keep=1), which the service HakiosGPU
+ * (the A51's: HakiosMali) says (it is there
  * before the first program runs, or not at all). Everywhere else -- QEMU, a run without the
  * boot-arg, a phone without the GPU's firmware in the image, a GPU that did not start --
  * nothing is loaded, and CoreAnimation draws with its own software renderer as in an image
@@ -1059,6 +1060,10 @@ opengl_es(void)
 	}
 	if (wanted < 0) {
 		gpu = IOServiceGetMatchingService(0, IOServiceMatching("HakiosGPU"));
+		if (gpu == 0) {
+			/* the Galaxy A51's Mali (devices/a51: a51gpu=8 a51gpu_keep=1), which Mesa's Panfrost draws with */
+			gpu = IOServiceGetMatchingService(0, IOServiceMatching("HakiosMali"));
+		}
 		wanted = gpu != 0;
 		if (gpu != 0) {
 			IOObjectRelease(gpu);

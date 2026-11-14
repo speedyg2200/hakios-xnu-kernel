@@ -105,6 +105,8 @@ struct hakios_drm_surface {
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };
 int hakios_drm_surface(int fd, struct hakios_drm_surface *surface);
+/* Not libdrm's: the size of the buffer an IOSurface would be (Panfrost's import asks lseek() of a dma-buf for it). */
+size_t hakios_drm_import_size(int fd, int surface);
 /* Not libdrm's: which IOSurface's memory is mapped at BASE in this process, told by whoever maps it (AdrenoMetal's frontend,
  * tools/m2v), for Turnip's VK_EXT_external_memory_host, which is given only the address: its ID, 0 if nobody said. */
 void hakios_drm_host_surface(const void *base, uint64_t size, uint32_t surface);
