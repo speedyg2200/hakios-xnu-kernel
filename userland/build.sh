@@ -483,7 +483,7 @@ fi
 # devices/a51 hakios.a51wifi.c (a51wifi=N) loads it into the WLBT core
 if [ -d ../fw-wifi-a51 ]; then
 	mkdir -p root/fw
-	cp ../fw-wifi-a51/* root/fw/
+	find ../fw-wifi-a51 -maxdepth 1 -type f -exec cp {} root/fw/ \;      # (not debug/: the log strings stay on the PC)
 fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
