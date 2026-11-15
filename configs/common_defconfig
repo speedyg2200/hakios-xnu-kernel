@@ -94,6 +94,9 @@ CONFIG_HAKIOS_UFS=y
 # a disk image of the host as /dev/rvblk0 (virtio_blk=1). QEMU only [hakios.virtio_blk.c]
 CONFIG_HAKIOS_VIRTIO_BLK=y
 
+# what Darwin's Wi-Fi side talks to, whichever radio stands behind it [hakios.sta.c, hakios.apple80211.c, hakios.wlan.cpp]
+CONFIG_HAKIOS_WIFI_STATION=y
+
 # Wi-Fi of the WCN6750 (wifi=1, wifi_step=N): the DSP that runs the radio's firmware, Linux's ath11k (its object, made ... [hakios.wifi.c, hakios.wlfw.c, hakios.lx.c, hakios.sta.c, hakios.apple80211.c, hakios.wlan.cpp; requires CONFIG_HAKIOS_QMI]
 CONFIG_HAKIOS_WIFI=y
 

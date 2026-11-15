@@ -13,6 +13,7 @@
  * of its conf (SOUND requires ADSP and SPEAKER, MODEM requires QMI and UFS, ...), and tools/hakios-config.py refuses
  * the configuration that would need a stand-in for it.
  */
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/errno.h>
@@ -21,6 +22,7 @@
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.virtio_blk.h>
+#include <sys/systm.h>
 
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
 void hakios_adsp_stop(void);
@@ -80,8 +82,23 @@ void hakios_adreno_minute(void) {}
 void hakios_wifi_init(void) {}
 void hakios_wifi_stop(void) {}
 void hakios_wifi_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_WIFI_STATION
 errno_t hakios_apple80211_ioctl(__unused u_long command, __unused void *data) { return EOPNOTSUPP; }
 void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *address) {}
+#elif !defined(HAKIOS_WIFI)
+/* the station boundary's messages, with another radio than the WCN6750 behind it (hakios.wifi.c has the real one) */
+int
+hakios_wifi_tell(const char *format, ...)
+{
+	va_list ap;
+
+	va_start(ap, format);
+	vprintf(format, ap);
+	va_end(ap);
+	return 0;
+}
 #endif
 
 #ifndef HAKIOS_ADSP
