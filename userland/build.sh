@@ -479,6 +479,12 @@ if [ -d ../fw-acpm ]; then
 	mkdir -p root/fw
 	cp ../fw-acpm/*.fw root/fw/
 fi
+# the Galaxy A51's Wi-Fi firmware (mx140.bin and its .hcf, from /vendor/etc/wifi of its Android; never in the repository):
+# devices/a51 hakios.a51wifi.c (a51wifi=N) loads it into the WLBT core
+if [ -d ../fw-wifi-a51 ]; then
+	mkdir -p root/fw
+	cp ../fw-wifi-a51/* root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
