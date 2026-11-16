@@ -528,7 +528,7 @@ public:
 	/* Exynos DECON in command mode (fb_decon): one transfer to the panel after each frame is whole */
 	vm_offset_t fDecon;
 	bool fDeconTrig, fDeconArmed;
-	uint32_t fDeconFrames, fDeconLate, fDeconWaitDone;
+	uint32_t fDeconFrames, fDeconLate, fDeconWaitDone, fDeconTorn, fDeconExtra;
 	uint64_t fDeconWaitTime;
 	void deconBefore(void);
 	void deconAfter(void);
@@ -1120,8 +1120,22 @@ IOMobileFramebuffer::deconBefore(void)
 		fDeconWaitDone++;
 		fDeconFrames++;
 	}
+	uint32_t te0 = deconRead(fDecon, DECON_TE_CNT) & 0xffff;
 	deconWrite(fDecon, DECON_TRIG, (deconRead(fDecon, DECON_TRIG) & ~DECON_HW_TRIG_EN) | DECON_HW_TRIG_MASK);
 	deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+	/*
+	 * A transfer takes most of a refresh: "done" comes close to the next TE, and a TE that came between it and the mask
+	 * above started one more, which then read the framebuffer while the next frame was written (1 frame in 10 seen torn,
+	 * 16 November). If the TE count moved since "done", that transfer is waited out before anything is written.
+	 */
+	if ((deconRead(fDecon, DECON_TE_CNT) & 0xffff) != te0) {
+		/* (at most 20 ms, a transfer and some: a TE that came just after the mask started nothing, and nothing ends) */
+		fDeconExtra++;
+		for (uint32_t us = 0; us < 20000 && !(deconRead(fDecon, DECON_INT_PENDING) & DECON_FRAME_DONE); us += 50) {
+			IODelay(50);
+		}
+		deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+	}
 	fDeconArmed = false;
 }
 
@@ -1132,6 +1146,10 @@ IOMobileFramebuffer::deconAfter(void)
 {
 	if (!fDeconTrig) {
 		return;
+	}
+	/* (a transfer while the frame was written -- masked, it should not be -- is a frame that may have come out torn) */
+	if (deconRead(fDecon, DECON_INT_PENDING) & (DECON_FRAME_START | DECON_FRAME_DONE)) {
+		fDeconTorn++;
 	}
 	deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
 	deconWrite(fDecon, DECON_TRIG, (deconRead(fDecon, DECON_TRIG) & ~DECON_HW_TRIG_MASK) | DECON_HW_TRIG_EN);
@@ -1160,8 +1178,13 @@ IOMobileFramebuffer::deconProbe(void)
 	    "in 1 s: frame count %u -> %u, TE count %#x -> %#x\n", trig, (trig & DECON_HW_TRIG_EN) ? "on" : "off",
 	    (trig & DECON_HW_TRIG_MASK) ? "masked" : "not masked", enable, pending, frames0, frames1, te0, te1);
 	if (fDeconTrig) {
-		IOLog("MiniIOMobileFramebuffer: fb_decon_trig: %u frames sent one by one so far, %u waits for the transfer before "
-		    "(%u gave up)\n", fDeconFrames, fDeconWaitDone, fDeconLate);
+		/* said again every 30 s while it lasts: the frames, and any transfer seen while a frame was being written */
+		while (fDeconTrig) {
+			IOLog("MiniIOMobileFramebuffer: fb_decon_trig: %u frames sent one by one so far, %u waits for the transfer before "
+			    "(%u gave up); %u transfers while a frame was written; %u begun after \"done\", waited out\n", fDeconFrames,
+			    fDeconWaitDone, fDeconLate, fDeconTorn, fDeconExtra);
+			IOSleep(30000);
+		}
 		return;
 	}
 	/* how the start and the end of transfers come, for 50 ms: the times they were first seen after being cleared */

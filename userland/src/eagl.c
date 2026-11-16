@@ -687,9 +687,27 @@ surface_changed(struct eagl *e, struct image *image)
 		return false;
 	}
 	image->looked = e->frames + 1;
-	for (size_t at = 0; at + 8 <= size; at += 8) {
+	/*
+	 * Four sums side by side, 32 bytes a turn, put together at the end: one chain of multiplications waits on each one
+	 * before it and was still 13% of the drawing thread on the Galaxy A51 (glprof, 16 November); four keep the
+	 * multiplier busy, and the memory is what it waits for.
+	 */
+	uint64_t lane[4] = { sum, sum ^ 1, sum ^ 2, sum ^ 3 }, words[4];
+	size_t at = 0;
+	for (; at + 32 <= size; at += 32) {
+		memcpy(words, base + at, 32);
+		for (int k = 0; k < 4; k++) {
+			lane[k] = (lane[k] ^ words[k]) * 0x9e3779b97f4a7c15ull;
+			lane[k] ^= lane[k] >> 29;
+		}
+	}
+	for (; at + 8 <= size; at += 8) {
 		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
+		lane[0] = (lane[0] ^ word) * 0x9e3779b97f4a7c15ull;
+		lane[0] ^= lane[0] >> 29;
+	}
+	for (int k = 0; k < 4; k++) {
+		sum = (sum ^ lane[k]) * 0x9e3779b97f4a7c15ull;
 		sum ^= sum >> 29;
 	}
 	if (sum == image->sum) {
@@ -1006,7 +1024,7 @@ show_texture(struct eagl *e, struct image *image)
  * While the drawing thread is held (thread_suspend) nothing here allocates or takes a lock: it may hold malloc's.
  */
 #define PROF_SLOTS      8192
-#define PROF_DUMP       4000
+#define PROF_DUMP       12000
 #define PROF_SHOWN      30
 #define PROF_DEPTH      9                       /* the program counter, the link register, seven callers from the frame chain */
 static unsigned prof_us;                        /* 0: no profile */
@@ -1099,6 +1117,85 @@ prof_main(__unused void *argument)
 				    (unsigned long long)offset, where.dli_sname != NULL ? where.dli_sname : "?");
 			}
 			say("%s\n", line);
+		}
+		/*
+		 * ... and the same samples by where they were alone, whatever called: the image of the program counter (all of
+		 * them), and the most frequent program counters. A frame's time is spread over many stacks (the 400 most frequent
+		 * were a third of it, 16 November), and this says what all of it was.
+		 */
+		{
+			static struct {
+				const char *image;
+				unsigned count;
+			} images[48];
+			static struct {
+				uint64_t pc;
+				unsigned count;
+			} pcs[4096];
+			unsigned n_images = 0;
+
+			memset(images, 0, sizeof(images));
+			memset(pcs, 0, sizeof(pcs));
+			for (unsigned i = 0; i < PROF_SLOTS && prof_table[i].count != 0; i++) {
+				Dl_info where = { 0 };
+				const char *image = "?", *slash;
+				uint64_t pc = prof_table[i].stack[0];
+
+				if (dladdr((void *)(uintptr_t)pc, &where) != 0 && where.dli_fname != NULL) {
+					image = (slash = strrchr(where.dli_fname, '/')) != NULL ? slash + 1 : where.dli_fname;
+				}
+				unsigned k;
+				for (k = 0; k < n_images && strcmp(images[k].image, image) != 0; k++) {
+				}
+				if (k == n_images && n_images < 48) {
+					images[n_images++].image = image;
+				}
+				if (k < 48) {
+					images[k].count += prof_table[i].count;
+				}
+				for (unsigned j = (unsigned)((pc * 0x9e3779b97f4a7c15ull) >> 52) % 4096, probes = 0; probes < 4096;
+				    j = (j + 1) % 4096, probes++) {
+					if (pcs[j].count == 0 || pcs[j].pc == pc) {
+						pcs[j].pc = pc;
+						pcs[j].count += prof_table[i].count;
+						break;
+					}
+				}
+			}
+			char line[1024];
+			int at = snprintf(line, sizeof(line), "hakios-prof: by image:");
+			for (unsigned shown = 0; shown < n_images && at < (int)sizeof(line) - 40; shown++) {
+				unsigned best = 0;
+				for (unsigned k = 1; k < n_images; k++) {
+					best = images[k].count > images[best].count ? k : best;
+				}
+				if (images[best].count == 0) {
+					break;
+				}
+				at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %.1f%%", images[best].image,
+				    100.0 * images[best].count / taken);
+				images[best].count = 0;
+			}
+			say("%s\n", line);
+			for (unsigned shown = 0; shown < 60; shown++) {
+				unsigned best = 0;
+				for (unsigned j = 1; j < 4096; j++) {
+					best = pcs[j].count > pcs[best].count ? j : best;
+				}
+				if (pcs[best].count == 0) {
+					break;
+				}
+				Dl_info where = { 0 };
+				const char *image = "?", *slash;
+				uint64_t offset = pcs[best].pc;
+				if (dladdr((void *)(uintptr_t)offset, &where) != 0 && where.dli_fname != NULL) {
+					image = (slash = strrchr(where.dli_fname, '/')) != NULL ? slash + 1 : where.dli_fname;
+					offset -= (uint64_t)(uintptr_t)where.dli_fbase;
+				}
+				say("hakios-prof: pc %.1f%% %s+0x%llx(%s)\n", 100.0 * pcs[best].count / taken, image,
+				    (unsigned long long)offset, where.dli_sname != NULL ? where.dli_sname : "?");
+				pcs[best].count = 0;
+			}
 		}
 		memset(prof_table, 0, sizeof(prof_table));
 		taken = looks = 0;
