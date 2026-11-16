@@ -1,0 +1,44 @@
+--- a/src/gallium/drivers/panfrost/pan_bo.c	2026-11-16 10:58:09.206734183 +0200
++++ b/src/gallium/drivers/panfrost/pan_bo.c	2026-11-16 10:58:09.252501772 +0200
+@@ -121,9 +121,17 @@
+    return NULL;
+ }
+ 
++#ifdef __APPLE__
++static void panfrost_bo_munmap(struct panfrost_bo *bo);
++#endif
++
+ static void
+ panfrost_bo_free(struct panfrost_bo *bo)
+ {
++#ifdef __APPLE__
++   /* a BO from the cache keeps its mapping there (see panfrost_bo_unreference): given back when the BO is freed */
++   panfrost_bo_munmap(bo);
++#endif
+    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
+    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
+    uint64_t gpu_va = bo->ptr.gpu;
+@@ -465,7 +473,14 @@
+     */
+    if (p_atomic_read(&bo->refcnt) == 0) {
+       /* When the reference count goes to zero, we need to cleanup */
++#ifndef __APPLE__
+       panfrost_bo_munmap(bo);
++#else
++      /* On Darwin a mapping is a round trip to the kernel each way (IOConnectMapMemory, and hakios_drm_unmap), and the
++       * kernel never takes a cached BO's memory away (MADVISE: retained, always): a BO keeps its mapping in the cache,
++       * and is given it back with the BO from there (panfrost_bo_mmap sees it mapped). The window server mapped and
++       * unmapped some 16 BOs a frame (HakiosMali's request counts, 16 November). */
++#endif
+ 
+       if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+          pandecode_inject_free(dev->decode_ctx, bo->ptr.gpu,
+@@ -475,7 +490,7 @@
+        * allocations if we're allowed to.
+        */
+       if (!panfrost_bo_cache_put(bo))
+-         panfrost_bo_free(bo);
++         panfrost_bo_free(bo);  /* (unmaps it on Darwin) */
+    }
+    pthread_mutex_unlock(&dev->bo_map_lock);
+ }

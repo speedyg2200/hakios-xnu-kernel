@@ -96,6 +96,20 @@ drmIoctl(int fd, unsigned long request, void *arg)
 
 	if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT) {
 		error = -panfrost_submit(arg);
+	} else if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_MADVISE) {
+		/*
+		 * Answered here, as the kernel answers it (HakiosMali: nothing is ever taken away, retained = 1): Mesa asks at
+		 * every BO it puts in its cache and takes out again, and a request is a round trip to the kernel -- some 56 a
+		 * frame of the window server's (HakiosMali's request counts, 16 November).
+		 */
+		((struct drm_panfrost_madvise *)arg)->retained = 1;
+		error = 0;
+	} else if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_MMAP_BO) {
+		/* ... and where to map a BO: always its handle in the upper half, as the kernel says (kPanfrostMmapBO) */
+		struct drm_panfrost_mmap_bo *mmap_bo = arg;
+
+		mmap_bo->offset = (uint64_t)mmap_bo->handle << 32;
+		error = 0;
 	} else {
 		error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
 	}
