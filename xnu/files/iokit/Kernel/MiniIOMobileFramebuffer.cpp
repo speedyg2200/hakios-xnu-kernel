@@ -314,6 +314,10 @@ measurePanel(__unused void * arg, __unused wait_result_t wr)
  * after the driver starts (the panel's picture is read out and written back as it was: nothing changes on the screen).
  */
 static TUNABLE(uint32_t, gBench, "fb_bench", 0);
+/* Boot-args fb_decon=PHYSICAL and fb_decon_trig=1: the Exynos display controller and its trigger (see deconBefore()). */
+static TUNABLE(uint64_t, gDeconPhysical, "fb_decon", 0);
+static TUNABLE(uint32_t, gDeconTrig, "fb_decon_trig", 0);
+static vm_offset_t deconRegisters(void);
 
 static uint64_t
 benchMicros(uint64_t since)
@@ -521,6 +525,15 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+	/* Exynos DECON in command mode (fb_decon): one transfer to the panel after each frame is whole */
+	vm_offset_t fDecon;
+	bool fDeconTrig, fDeconArmed;
+	uint32_t fDeconFrames, fDeconLate, fDeconWaitDone;
+	uint64_t fDeconWaitTime;
+	void deconBefore(void);
+	void deconAfter(void);
+	void deconProbe(void);
+	static void deconProbeMain(void * self, wait_result_t result);
 public:
 	void benchDraw(MiniIOSurface * s);              /* fb_bench: drawRows alone, outside a frame */
 	static IOMobileFramebuffer * gBenchSelf;
@@ -664,6 +677,13 @@ IOMobileFramebuffer::start(IOService * provider)
 	if (gBeam != 0 && kernel_thread_start(beamProbeMain, this, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "the panel's scan: looked at");
 		thread_deallocate(thread);
+	}
+	fDecon = deconRegisters();
+	if (fDecon != 0) {
+		fDeconTrig = gDeconTrig != 0;
+		if (kernel_thread_start(deconProbeMain, this, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
 	}
 	gBenchSelf = this;
 	if (gBench && kernel_thread_start(benchMemory, NULL, &thread) == KERN_SUCCESS) {
@@ -1010,6 +1030,162 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 }
 
 IOMobileFramebuffer * IOMobileFramebuffer::gBenchSelf;
+
+/*
+ * The Exynos display controller (DECON) in MIPI command mode, as the Galaxy A51's boot loader leaves it (dt decon_f:
+ * psr_mode 2, trig_mode 0): the panel keeps the picture in its own memory and says when it may be sent a new one (TE);
+ * on each TE, while the hardware trigger is enabled and not masked, DECON reads the whole framebuffer and sends it.
+ * This driver writing the framebuffer while DECON read it was the tearing. With boot-arg fb_decon_trig=1 the trigger is
+ * armed once after each frame is whole and masked again when the transfer has begun, and the next frame waits for that
+ * transfer to be done before it is written (as Samsung's dpu20: decon_reg_set_trigger, decon_reg_get_interrupt_and_clear).
+ * Registers (cal_9610/regs-decon.h): HW_SW_TRIG_CONTROL 0x70 (HW_TRIG_EN bit 0, HW_TRIG_MASK_DECON bit 4),
+ * INTERRUPT_ENABLE 0x40, INTERRUPT_PENDING 0x4c (FRAME_START bit 12, FRAME_DONE bit 13, written 1 to clear), HW_TE_CNT
+ * 0x78, FRAME_COUNT 0x2a0. Boot-arg fb_decon=PHYSICAL names the controller; an Exynos 9611 kernel knows its own (0x148b0000).
+ */
+#define DECON_EXYNOS9611        0x148B0000UL
+#define DECON_INT_ENABLE        0x040
+#define DECON_INT_PENDING       0x04c
+#define DECON_FRAME_START       (1u << 12)
+#define DECON_FRAME_DONE        (1u << 13)
+#define DECON_TRIG              0x070
+#define DECON_HW_TRIG_EN        (1u << 0)
+#define DECON_HW_TRIG_MASK      (1u << 4)
+#define DECON_TE_CNT            0x078
+#define DECON_FRAME_COUNT       0x2a0
+#define DECON_WAIT_MS           50
+
+static vm_offset_t
+deconRegisters(void)
+{
+	char version[128] = "";
+	uint64_t physical = gDeconPhysical;
+
+	if (physical == 0 && PE_parse_boot_argn("hakios_kver", version, sizeof(version)) &&
+	    strnstr(version, "-exynos9611-", sizeof(version)) != NULL) {
+		physical = DECON_EXYNOS9611;
+	}
+	return physical != 0 ? ml_io_map((vm_offset_t) physical, 0x1000) : 0;
+}
+
+static inline uint32_t
+deconRead(vm_offset_t d, uint32_t offset)
+{
+	return *(volatile uint32_t *)(d + offset);
+}
+
+static inline void
+deconWrite(vm_offset_t d, uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(d + offset) = value;
+	__asm__ volatile ("dsb sy");
+}
+
+/* Wait (spinning, in steps of 50 us) for an interrupt-pending bit; false after DECON_WAIT_MS. */
+static bool
+deconWaitPending(vm_offset_t d, uint32_t bit)
+{
+	for (uint32_t us = 0; us < DECON_WAIT_MS * 1000; us += 50) {
+		if (deconRead(d, DECON_INT_PENDING) & bit) {
+			return true;
+		}
+		IODelay(50);
+	}
+	return false;
+}
+
+/*
+ * Before a frame is written: a transfer since the last frame was armed has to be over (on this panel FRAME_START comes
+ * with FRAME_DONE, near the transfer's end, so "done" is the one waited for), and then the trigger is masked, so that no
+ * TE starts a transfer while the frame is written. (Waiting for the transfer right after arming it, as at first, made
+ * each frame wait out a TE and a transfer before the next could be written: 34 ms a frame, 16 November.)
+ */
+void
+IOMobileFramebuffer::deconBefore(void)
+{
+	if (!fDeconTrig) {
+		return;
+	}
+	if (fDeconArmed) {
+		uint64_t began = mach_absolute_time();
+		if (!deconWaitPending(fDecon, DECON_FRAME_DONE)) {
+			/* nothing sent 50 ms after it was armed: the trigger is left as the boot loader had it, and this stops */
+			fDeconTrig = false;
+			fDeconLate++;
+			IOLog("MiniIOMobileFramebuffer: fb_decon_trig: no transfer done %u ms after the trigger was armed (trigger control %#x, "
+			    "pending %#x): DECON is left sending on every TE, frames are no longer timed by it\n", DECON_WAIT_MS,
+			    deconRead(fDecon, DECON_TRIG), deconRead(fDecon, DECON_INT_PENDING));
+			return;
+		}
+		fDeconWaitTime += mach_absolute_time() - began;
+		fDeconWaitDone++;
+		fDeconFrames++;
+	}
+	deconWrite(fDecon, DECON_TRIG, (deconRead(fDecon, DECON_TRIG) & ~DECON_HW_TRIG_EN) | DECON_HW_TRIG_MASK);
+	deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+	fDeconArmed = false;
+}
+
+/* After: the frame is whole, the trigger armed -- sent at the next TE, and at every TE after until the next frame (the
+ * same whole picture again, which is harmless), with no waiting here. */
+void
+IOMobileFramebuffer::deconAfter(void)
+{
+	if (!fDeconTrig) {
+		return;
+	}
+	deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+	deconWrite(fDecon, DECON_TRIG, (deconRead(fDecon, DECON_TRIG) & ~DECON_HW_TRIG_MASK) | DECON_HW_TRIG_EN);
+	fDeconArmed = true;
+}
+
+void
+IOMobileFramebuffer::deconProbeMain(void * self, wait_result_t result __unused)
+{
+	((IOMobileFramebuffer *) self)->deconProbe();
+}
+
+/* What DECON is doing, looked at 100 s after the start (the phone's log keeps only its last minutes); reads, and the
+ * pending bits cleared (written 1) to see how they come back when DECON is not under this driver's trigger. */
+void
+IOMobileFramebuffer::deconProbe(void)
+{
+	vm_offset_t d = fDecon;
+
+	IOSleep(100000);
+	uint32_t trig = deconRead(d, DECON_TRIG), enable = deconRead(d, DECON_INT_ENABLE);
+	uint32_t pending = deconRead(d, DECON_INT_PENDING), frames0 = deconRead(d, DECON_FRAME_COUNT), te0 = deconRead(d, DECON_TE_CNT);
+	IOSleep(1000);
+	uint32_t frames1 = deconRead(d, DECON_FRAME_COUNT), te1 = deconRead(d, DECON_TE_CNT);
+	IOLog("MiniIOMobileFramebuffer: fb_decon: trigger control %#x (hardware trigger %s, %s), interrupts enabled %#x, pending %#x; "
+	    "in 1 s: frame count %u -> %u, TE count %#x -> %#x\n", trig, (trig & DECON_HW_TRIG_EN) ? "on" : "off",
+	    (trig & DECON_HW_TRIG_MASK) ? "masked" : "not masked", enable, pending, frames0, frames1, te0, te1);
+	if (fDeconTrig) {
+		IOLog("MiniIOMobileFramebuffer: fb_decon_trig: %u frames sent one by one so far, %u waits for the transfer before "
+		    "(%u gave up)\n", fDeconFrames, fDeconWaitDone, fDeconLate);
+		return;
+	}
+	/* how the start and the end of transfers come, for 50 ms: the times they were first seen after being cleared */
+	deconWrite(d, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+	uint64_t t0 = mach_absolute_time(), start = 0, done = 0, ns_start = 0, ns_done = 0, window;
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &window);
+	while (mach_absolute_time() - t0 < window && (start == 0 || done == 0)) {
+		uint32_t p = deconRead(d, DECON_INT_PENDING);
+		if (start == 0 && (p & DECON_FRAME_START)) {
+			start = mach_absolute_time();
+		}
+		if (start != 0 && done == 0 && (p & DECON_FRAME_DONE) && mach_absolute_time() > start) {
+			done = mach_absolute_time();
+		}
+	}
+	if (start != 0) {
+		absolutetime_to_nanoseconds(start - t0, &ns_start);
+	}
+	if (done != 0) {
+		absolutetime_to_nanoseconds(done - start, &ns_done);
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_decon: after the pending bits were cleared: a frame began %s%llu us later, and was "
+	    "done %s%llu us after it began\n", start ? "" : "(never) ", ns_start / 1000, done ? "" : "(never) ", ns_done / 1000);
+}
 
 /* fb_bench: the whole surface onto the panel by drawRows on this one thread, nearest neighbour, as a frame's would be */
 void
@@ -1607,7 +1783,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (fBeamIntf != 0) {
 		/* (on the panel when that scan reads it: that is the beat now, kept by the panel) */
 		fStatOnBeat++;
-	} else if (gOnTheBeat) {
+	} else if (gOnTheBeat && !fDeconTrig) {        /* (under DECON's trigger the panel's TE is the beat) */
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1631,6 +1807,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			began = mach_absolute_time();
 		}
 	}
+	deconBefore();
 	shown = began;
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
@@ -1706,6 +1883,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	drawn = mach_absolute_time();
+	deconAfter();
 	if (recorded != NULL) {
 		record(recorded);
 	}

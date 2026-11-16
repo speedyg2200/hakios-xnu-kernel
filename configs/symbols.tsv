@@ -82,7 +82,10 @@ DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
 FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
 FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_BENCH	arg	fb_bench	GPU and display	k	MiniIOMobileFramebuffer.cpp	how fast the framebuffer's memory is to read and to write, against ordinary memory, once, 100 s
 FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's
+FB_DECON	arg	fb_decon	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_DECON_TRIG	arg	fb_decon_trig	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_DIFF	arg	fb_diff	GPU and display	k	MiniIOMobileFramebuffer.cpp	which pixels of the panel each frame changed (it costs: the panel's memory is slow to read)
 FB_FILTER	arg	fb_filter	GPU and display	k	MiniIOMobileFramebuffer.cpp	the picture is scaled to the panel nearest neighbour, as it once was
 FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -203,6 +206,7 @@ PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, n
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
 PRIVS	arg	privs	Security stand-ins	k	kern_minimac.c	
+PSCI_TRAMPOLINE	arg	psci_trampoline	Loader	l	loader.c	
 RD	arg	rd	CPU, memory and boot	kl	(patch),loader.c	
 REC_MB	arg	rec_mb	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_RING	arg	rec_ring	GPU and display	k	MiniIOMobileFramebuffer.cpp	
