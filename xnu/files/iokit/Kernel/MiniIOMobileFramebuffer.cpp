@@ -25,6 +25,7 @@
 #include <sys/sysctl.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+extern "C" int cpu_number(void);
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -190,6 +191,12 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
 /*
+ * (On the Galaxy A51, Exynos 9611, one: the boot loader's framebuffer is write-combined memory, and three processors
+ * writing it at once got some 100 MB/s between them -- a panel row 44 us -- where one alone gets 1.3 GB/s and more, a row
+ * 3.4 us; a frame took 38 ms in three shares and takes 13 in one. Reading the surfaces was never the trouble. Found row by
+ * row with the probes of 16 November; devices/a51/configs/a51.config sets CONFIG_FB_THREADS=1.)
+ */
+/*
  * Boot-arg fb_pri=N: the scheduling priority of the threads that put frames on the panel (the presenter and its
  * helpers); 0 is the kernel's default for its threads. By default 92 (BASEPRI_PREEMPT): at the kernel's they lost the
  * processors to the window server's own real-time threads under load, and a frame took 3.6 ms to put on the panel
@@ -302,6 +309,76 @@ measurePanel(__unused void * arg, __unused wait_result_t wr)
 	    "(frames are made at %u a second: fb_hz)\n", (on & 1) ? "on" : "OFF", second - first, refreshHz());
 }
 
+/*
+ * Boot-arg fb_bench=1: how fast the framebuffer's memory is to read and to write, against ordinary memory, once, 100 s
+ * after the driver starts (the panel's picture is read out and written back as it was: nothing changes on the screen).
+ */
+static TUNABLE(uint32_t, gBench, "fb_bench", 0);
+
+static uint64_t
+benchMicros(uint64_t since)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+	return ns / 1000;
+}
+
+static void benchDrawShown(MiniIOSurface * s);  /* (after the class: drawRows alone) */
+
+static void
+benchMemory(__unused void * arg, __unused wait_result_t wr)
+{
+	size_t bytes;
+	uint8_t * a, * b;
+	uint64_t t, read_us, write_us, copy_us, set_us;
+
+	IOSleep(100000);                        /* (the phone's log keeps only its last minutes) */
+	bytes = (size_t) vinfo.v_height * vinfo.v_rowbytes;
+	a = (uint8_t *) IOMallocData(bytes);
+	b = (uint8_t *) IOMallocData(bytes);
+	if (a == NULL || b == NULL || vinfo.v_baseaddr == 0) {
+		IOLog("MiniIOMobileFramebuffer: fb_bench: no memory\n");
+		return;
+	}
+	memset(b, 1, bytes);                    /* (the pages there before the timing) */
+	t = mach_absolute_time();
+	memcpy(a, (const void *) vinfo.v_baseaddr, bytes);
+	read_us = benchMicros(t);
+	t = mach_absolute_time();
+	memcpy((void *) vinfo.v_baseaddr, a, bytes);
+	write_us = benchMicros(t);
+	t = mach_absolute_time();
+	memcpy(b, a, bytes);
+	copy_us = benchMicros(t);
+	t = mach_absolute_time();
+	for (size_t i = 0; i < bytes; i += 4) {     /* a word at a time, as drawRows writes */
+		*(volatile uint32_t *)(vinfo.v_baseaddr + i) = *(const uint32_t *)(a + i);
+	}
+	set_us = benchMicros(t);
+	IOLog("MiniIOMobileFramebuffer: fb_bench: %zu bytes: reading the framebuffer %llu us (%llu MB/s), writing it %llu us "
+	    "(%llu MB/s), a word at a time %llu us (%llu MB/s); ordinary memory to memory %llu us (%llu MB/s)\n", bytes, read_us,
+	    read_us ? bytes / read_us : 0, write_us, write_us ? bytes / write_us : 0, set_us, set_us ? bytes / set_us : 0, copy_us,
+	    copy_us ? bytes / copy_us : 0);
+	/* ... and the surface on the screen, which is what each frame is read from */
+	MiniIOSurface * shown = gShownSurface != 0 ? MiniIOSurfaceCopy(gShownSurface) : NULL;
+	if (shown != NULL) {
+		size_t length = shown->info.allocSize < bytes ? shown->info.allocSize : bytes;
+		t = mach_absolute_time();
+		memcpy(a, shown->pixels(), length);
+		read_us = benchMicros(t);
+		IOLog("MiniIOMobileFramebuffer: fb_bench: the surface on the screen (%u, %ux%u, %s): %zu bytes read in %llu us (%llu MB/s)\n",
+		    gShownSurface, shown->info.width, shown->info.height,
+		    shown->client != NULL ? "around a program's own memory" : "the kernel's memory", length, read_us,
+		    read_us ? length / read_us : 0);
+		benchDrawShown(shown);
+		benchDrawShown(shown);                  /* (twice: the second with the caches warm) */
+		MiniIOSurfaceDrop(shown);
+	}
+	IOFreeData(a, bytes);
+	IOFreeData(b, bytes);
+}
+
 static inline uint32_t
 refreshHz(void)
 {
@@ -391,6 +468,12 @@ public:
 	/* ... for each thread's share of the rows: how many, their time, begun after the scan reached them or not done before it left them, and done after it reached them */
 	uint64_t        fStatShareTime[8];
 	uint32_t        fStatShares[8], fStatShareTorn[8], fStatShareClose[8];
+	uint32_t        fStatShareCpu[8];               /* the processor a share last ran on */
+	uint32_t        fStatLayers, fStatScaled, fStatFiltered, fStatUnscaled;
+	uint64_t        fStatRecord;                    /* time in record() */
+	uint64_t        fStatRowGap;                    /* the longest one row took (absolute time) */
+	uint32_t        fStatRowsSlow, fStatRows;       /* rows that took over 1 ms, of all */
+	uint32_t        fStatClientLayers;              /* layers whose surface is around a program's own memory */
 	uint32_t        fStatSettleReused;      /* ... frames not drawn again filtered: the GPU had their surface for the next frame */
 	uint64_t        fReady;                 /* when the last frame was ready to be shown */
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
@@ -438,6 +521,10 @@ public:
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+public:
+	void benchDraw(MiniIOSurface * s);              /* fb_bench: drawRows alone, outside a frame */
+	static IOMobileFramebuffer * gBenchSelf;
+private:
 	static void helperMain(void * self, wait_result_t result);
 	static void beamProbeMain(void * self, wait_result_t result);
 	void beamProbe(void);
@@ -576,6 +663,10 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	if (gBeam != 0 && kernel_thread_start(beamProbeMain, this, &thread) == KERN_SUCCESS) {
 		thread_set_thread_name(thread, "the panel's scan: looked at");
+		thread_deallocate(thread);
+	}
+	gBenchSelf = this;
+	if (gBench && kernel_thread_start(benchMemory, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
 	if (gMeasure && kernel_thread_start(measurePanel, NULL, &thread) == KERN_SUCCESS) {
@@ -829,11 +920,21 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
 	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
 	bool filter = job->filter;
+	uint64_t row_last = mach_absolute_time(), gap_most = 0, ms1;
+	uint32_t rows_slow = 0;
 
+	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ms1);
 	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
 		uint32_t * to;
 
+		/* (how long the row before took: a few long ones are the thread taken off its processor, all long the memory) */
+		uint64_t row_now = mach_absolute_time();
+		if (row_now - row_last > gap_most) {
+			gap_most = row_now - row_last;
+		}
+		rows_slow += row_now - row_last > ms1;
+		row_last = row_now;
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
 		}
@@ -895,6 +996,59 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 				to[x] = from[fColumn[x]];
 			}
 		}
+	}
+	uint64_t row_end = mach_absolute_time();
+	if (row_end - row_last > gap_most) {
+		gap_most = row_end - row_last;
+	}
+	rows_slow += row_end - row_last > ms1;
+	if (gap_most > fStatRowGap) {
+		fStatRowGap = gap_most;                 /* (racy between the helpers: a statistic) */
+	}
+	__atomic_fetch_add(&fStatRowsSlow, rows_slow, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&fStatRows, (uint32_t) (y1 - y0), __ATOMIC_RELAXED);
+}
+
+IOMobileFramebuffer * IOMobileFramebuffer::gBenchSelf;
+
+/* fb_bench: the whole surface onto the panel by drawRows on this one thread, nearest neighbour, as a frame's would be */
+void
+IOMobileFramebuffer::benchDraw(MiniIOSurface * s)
+{
+	RowJob job;
+	uint64_t t, ns_draw, ns_rows;
+	int32_t sw = (int32_t) s->info.width, sh = (int32_t) s->info.height;
+
+	bzero(&job, sizeof(job));
+	job.pixels = s->pixels();
+	job.stride = s->info.bytesPerRow;
+	job.sw = sw;
+	job.sh = sh;
+	job.px1 = job.cx1 = (int32_t) fPanelWidth;
+	job.py1 = job.ry1 = (int32_t) fPanelHeight;
+	IOLockLock(fLock);                              /* (fColumn is the presenter's: worked out here as drawLayer would) */
+	for (int32_t x = 0; x < (int32_t) fPanelWidth; x++) {
+		fColumn[x] = (uint32_t) ((int64_t) x * sw / (int32_t) fPanelWidth);
+	}
+	t = mach_absolute_time();
+	drawRows(&job, 0, (int32_t) fPanelHeight, NULL);
+	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns_draw);
+	/* the same rows as plain copies (no scaling): what the memory alone costs in rows */
+	t = mach_absolute_time();
+	for (uint32_t y = 0; y < fPanelHeight && y < (uint32_t) sh; y++) {
+		memcpy(fBase + (size_t) y * fRowBytes, job.pixels + (size_t) y * job.stride, (size_t) fPanelWidth * 4);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns_rows);
+	IOLockUnlock(fLock);
+	IOLog("MiniIOMobileFramebuffer: fb_bench: drawRows alone, one thread, the whole panel nearest neighbour: %llu us; the rows "
+	    "copied as they are: %llu us (cpu %d)\n", ns_draw / NSEC_PER_USEC, ns_rows / NSEC_PER_USEC, cpu_number());
+}
+
+static void
+benchDrawShown(MiniIOSurface * s)
+{
+	if (IOMobileFramebuffer::gBenchSelf != NULL) {
+		IOMobileFramebuffer::gBenchSelf->benchDraw(s);
 	}
 }
 
@@ -1054,6 +1208,7 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
 
 	__atomic_fetch_add(&fStatShareTime[share], now - began, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&fStatShares[share], 1, __ATOMIC_RELAXED);
+	fStatShareCpu[share] = (uint32_t) cpu_number();
 	if (job->scan != 0) {
 		uint64_t blank = fBeamLines - fPanelHeight;
 		uint64_t top = job->scan + fBeamPeriod * ((uint64_t) firstRow + blank) / fBeamLines;
@@ -1185,8 +1340,15 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
 	job.scan = fSettling ? 0 : fBeamScan;
+	fStatLayers++;
+	fStatClientLayers += s->client != NULL;
+	fStatScaled += !job.unscaled;
+	fStatFiltered += filter;
+	fStatUnscaled += job.unscaled;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
+		uint64_t began = mach_absolute_time();
 		drawRows(&job, job.ry0, job.ry1, fBlendRow);
+		beamShareDone(&job, 0, job.ry0, job.ry1, began);
 		return;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
@@ -1547,6 +1709,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (recorded != NULL) {
 		record(recorded);
 	}
+	fStatRecord += mach_absolute_time() - drawn;
 	fSwapsShown++;
 	if (gTouchLat) {
 		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
@@ -1580,6 +1743,34 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate, fStatSettled, fStatScansMissed, fStatScans);
 		fStatScans = fStatScansMissed = 0;
+		if (fBeamIntf == 0) {
+			/* where the time goes: the layers, and each processor's share of the rows (us on average, the processor) */
+			char shares[8 * 24] = "";
+			size_t at = 0;
+			uint64_t recording;
+			for (unsigned share = 0; share < fThreads && share < 8; share++) {
+				uint64_t took;
+				absolutetime_to_nanoseconds(fStatShareTime[share], &took);
+				at += (size_t) snprintf(shares + at, sizeof(shares) - at, " %llu us on cpu %u",
+				    fStatShares[share] != 0 ? took / fStatShares[share] / NSEC_PER_USEC : 0, fStatShareCpu[share]);
+				fStatShareTime[share] = 0;
+				fStatShares[share] = 0;
+			}
+			absolutetime_to_nanoseconds(fStatRecord, &recording);
+			uint64_t gap;
+			absolutetime_to_nanoseconds(fStatRowGap, &gap);
+			IOLog("MiniIOMobileFramebuffer: %u layers drawn (%u scaled, %u of them filtered, %u copied as they are); shares:%s; "
+			    "recording %llu us a frame; rows: %u, %u of them over 1 ms, the longest %llu us; %u layers around a program's own "
+			    "memory; surfaces lately: %u %u %u %u %u %u %u %u\n", fStatLayers, fStatScaled,
+			    fStatFiltered, fStatUnscaled, shares, recording / fStatFrames / NSEC_PER_USEC, fStatRows, fStatRowsSlow,
+			    gap / NSEC_PER_USEC, fStatClientLayers, fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
+			    fStatSurfaces[4], fStatSurfaces[5], fStatSurfaces[6], fStatSurfaces[7]);
+			fStatClientLayers = 0;
+			fStatLayers = fStatScaled = fStatFiltered = fStatUnscaled = 0;
+			fStatRecord = 0;
+			fStatRowGap = 0;
+			fStatRowsSlow = fStatRows = 0;
+		}
 		if (fBeamIntf != 0) {
 			char shares[8 * 24] = "";
 			size_t at = 0;
