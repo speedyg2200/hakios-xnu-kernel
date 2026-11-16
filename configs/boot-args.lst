@@ -94,6 +94,8 @@ fb_beat	k
 fb_bench	k
 fb_ca_hz	k
 fb_decon	k
+fb_decon_double	k
+fb_decon_second	k
 fb_decon_trig	k
 fb_diff	k
 fb_filter	k

@@ -317,6 +317,9 @@ static TUNABLE(uint32_t, gBench, "fb_bench", 0);
 /* Boot-args fb_decon=PHYSICAL and fb_decon_trig=1: the Exynos display controller and its trigger (see deconBefore()). */
 static TUNABLE(uint64_t, gDeconPhysical, "fb_decon", 0);
 static TUNABLE(uint32_t, gDeconTrig, "fb_decon_trig", 0);
+/* Boot-arg fb_decon_double=1: two framebuffers, DECON shown one while the other is written (see deconDoubleSetup()). */
+static TUNABLE(uint32_t, gDeconDouble, "fb_decon_double", 0);
+static TUNABLE(uint64_t, gDeconSecond, "fb_decon_second", 0);   /* the second buffer's physical address, if the firmware keeps one */
 static vm_offset_t deconRegisters(void);
 
 static uint64_t
@@ -528,6 +531,16 @@ public:
 	/* Exynos DECON in command mode (fb_decon): one transfer to the panel after each frame is whole */
 	vm_offset_t fDecon;
 	bool fDeconTrig, fDeconArmed;
+	/* fb_decon_double: the two framebuffers, the input channel DECON reads them through */
+	bool fDouble, fDoublePending;
+	unsigned fDoubleShown;
+	uint8_t * fDoubleBase[2];
+	uint32_t fDoublePhys[2];
+	vm_offset_t fDoubleIdma;
+	IOBufferMemoryDescriptor * fDoubleMemory;
+	uint32_t fDoubleSwaps, fDoubleLate;
+	char fDoubleSaid[200];                          /* what deconDoubleSetup() found, said again by the probe */
+	void deconDoubleSetup(void);
 	uint32_t fDeconFrames, fDeconLate, fDeconWaitDone, fDeconTorn, fDeconExtra;
 	uint64_t fDeconWaitTime;
 	void deconBefore(void);
@@ -714,6 +727,9 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	if (fDecon != 0 && gDeconDouble) {
+		deconDoubleSetup();
+	}
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -1053,6 +1069,10 @@ IOMobileFramebuffer * IOMobileFramebuffer::gBenchSelf;
 #define DECON_TE_CNT            0x078
 #define DECON_FRAME_COUNT       0x2a0
 #define DECON_WAIT_MS           50
+#define DECON_SHADOW            0x060
+#define DECON_SHADOW_GLOBAL     (1u << 31)
+#define IDMA_ENABLE_REG         0x000
+#define IDMA_BASE_ADDR_Y        0x040
 
 static vm_offset_t
 deconRegisters(void)
@@ -1102,6 +1122,23 @@ deconWaitPending(vm_offset_t d, uint32_t bit)
 void
 IOMobileFramebuffer::deconBefore(void)
 {
+	if (fDouble) {
+		/* the last frame's buffer is DECON's once the shadow update has happened (at a frame's start): the other is free */
+		if (fDoublePending) {
+			bool applied = false;
+			for (uint32_t us = 0; us < DECON_WAIT_MS * 1000; us += 50) {
+				if (!(deconRead(fDecon, DECON_SHADOW) & DECON_SHADOW_GLOBAL)) {
+					applied = true;
+					break;
+				}
+				IODelay(50);
+			}
+			fDoubleLate += !applied;
+			fDoublePending = false;
+		}
+		fBase = fDoubleBase[1 - fDoubleShown];
+		return;
+	}
 	if (!fDeconTrig) {
 		return;
 	}
@@ -1144,6 +1181,17 @@ IOMobileFramebuffer::deconBefore(void)
 void
 IOMobileFramebuffer::deconAfter(void)
 {
+	if (fDouble) {
+		/* the written buffer to the input channel, taken at the next frame's start (DECON's global shadow update) */
+		unsigned next = 1 - fDoubleShown;
+		__asm__ volatile ("dsb sy");                    /* (the frame's writes out of the write-combining buffers first) */
+		*(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y) = fDoublePhys[next];
+		deconWrite(fDecon, DECON_SHADOW, deconRead(fDecon, DECON_SHADOW) | DECON_SHADOW_GLOBAL);
+		fDoubleShown = next;
+		fDoublePending = true;
+		fDoubleSwaps++;
+		return;
+	}
 	if (!fDeconTrig) {
 		return;
 	}
@@ -1154,6 +1202,106 @@ IOMobileFramebuffer::deconAfter(void)
 	deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
 	deconWrite(fDecon, DECON_TRIG, (deconRead(fDecon, DECON_TRIG) & ~DECON_HW_TRIG_MASK) | DECON_HW_TRIG_EN);
 	fDeconArmed = true;
+}
+
+/*
+ * fb_decon_double: two framebuffers. DECON reads the panel's picture through a DPP input channel (IDMA; the dt's dpp
+ * nodes: 0x14884000, 0x14883000, 0x14881000, 0x14882000), whose source address is IDMA_IN_BASE_ADDR_Y (0x40), a shadowed
+ * register DECON takes at a frame's start once SHADOW_REG_UPDATE_REQ's global bit (0x60, bit 31) is set, and clears the
+ * bit when it has (Samsung's dpu20: dpp_reg_configure_params, decon_reg_update_req_global). The trigger is left as the
+ * boot loader had it, sending on every TE; a frame is written into the buffer DECON is not reading and handed to it,
+ * and the next waits until DECON has taken it: nothing is ever read while it is written, and nothing waits for a
+ * transfer. The second buffer is physically contiguous, below 4 GB (the register is 32 bits), write-combined as the
+ * first; the channel used is the one whose address is the boot framebuffer's.
+ */
+void
+IOMobileFramebuffer::deconDoubleSetup(void)
+{
+	static const uint32_t channels[] = { 0x14884000, 0x14883000, 0x14881000, 0x14882000 };
+	uint64_t fb = vinfo.v_physaddr, size = round_page_64((uint64_t) vinfo.v_rowbytes * vinfo.v_height);
+
+	for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]) && fDoubleIdma == 0; i++) {
+		vm_offset_t idma = ml_io_map(channels[i], 0x1000);
+		if (idma != 0 && *(volatile uint32_t *)(idma + IDMA_BASE_ADDR_Y) == (uint32_t) fb) {
+			fDoubleIdma = idma;
+		}
+	}
+	if (fDoubleIdma == 0 || (fb >> 32) != 0) {
+		snprintf(fDoubleSaid, sizeof(fDoubleSaid), "no DPP channel reads the boot framebuffer (%#llx): one buffer, as before", fb);
+		IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
+		return;
+	}
+	/*
+	 * Boot-arg fb_decon_second=PHYSICAL: the second buffer is memory the firmware keeps aside (on the Galaxy A51, the
+	 * second half of UEFI's "Display Reserved", 0xCAA00000): mapped write-combined, nothing allocated. Only memory the
+	 * firmware does reserve may be named: the loader gives XNU the largest free block (above 4 GB there) and the rest is
+	 * nobody's -- the loader's own allocations included. Without it, an allocation below 4 GB is tried, which finds
+	 * nothing where XNU owns no memory below 4 GB (the A51).
+	 */
+	uint8_t * second = NULL;
+	if (gDeconSecond != 0 && (gDeconSecond >> 32) == 0 && (gDeconSecond & PAGE_MASK) == 0) {
+		uint64_t second_phys_given = gDeconSecond;
+		/*
+		 * mapped through IOKit into the kernel's map: ml_io_map_wcomb() takes its addresses from the small I/O map, which
+		 * the boot framebuffer's 10 MB nearly fill, and panics when it has no room ("kmem_alloc ... failed with 3", 16 November)
+		 */
+		IOMemoryDescriptor * physical = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) second_phys_given,
+		    (IOByteCount) size, kIODirectionInOut);
+		IOMemoryMap * map = physical != NULL ? physical->createMappingInTask(kernel_task, 0, kIOMapAnywhere |
+		    kIOMapWriteCombineCache) : NULL;
+		second = map != NULL ? (uint8_t *) map->getVirtualAddress() : NULL;     /* (both kept for good) */
+		if (second == NULL) {
+			OSSafeReleaseNULL(physical);
+			snprintf(fDoubleSaid, sizeof(fDoubleSaid), "fb_decon_second %#llx could not be mapped: one buffer, as before",
+			    second_phys_given);
+			IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
+			return;
+		}
+		if (second != NULL) {
+			fDoubleBase[0] = fBase;
+			fDoublePhys[0] = (uint32_t) fb;
+			fDoubleBase[1] = second;
+			fDoublePhys[1] = (uint32_t) second_phys_given;
+			memcpy(fDoubleBase[1], fDoubleBase[0], (size_t) ((uint64_t) vinfo.v_rowbytes * vinfo.v_height));
+			fDoubleShown = 0;
+			fDouble = true;
+			fDeconTrig = false;
+			snprintf(fDoubleSaid, sizeof(fDoubleSaid), "two framebuffers, %#x and %#x (the firmware's, fb_decon_second; %llu bytes)",
+			    fDoublePhys[0], fDoublePhys[1], size);
+			IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
+			return;
+		}
+	}
+	fDoubleMemory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+	    kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, 0x00000000FFFFF000ULL);
+	if (fDoubleMemory != NULL) {
+		second = (uint8_t *) fDoubleMemory->getBytesNoCopy();
+	} else {
+		fDoubleMemory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+		    kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ULL);
+		IOMemoryMap * map = fDoubleMemory != NULL ? fDoubleMemory->createMappingInTask(kernel_task, 0, kIOMapAnywhere |
+		    kIOMapWriteCombineCache) : NULL;
+		second = map != NULL ? (uint8_t *) map->getVirtualAddress() : NULL;     /* (the map is kept: never released) */
+	}
+	uint64_t second_phys = fDoubleMemory != NULL ? fDoubleMemory->getPhysicalAddress() : 0;
+	if (second == NULL || second_phys == 0 || (second_phys >> 32) != 0) {
+		snprintf(fDoubleSaid, sizeof(fDoubleSaid), "no %llu bytes in one piece below 4 GB (got %s, at %#llx): one buffer, as "
+		    "before", size, fDoubleMemory != NULL ? "memory" : "none", second_phys);
+		IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
+		OSSafeReleaseNULL(fDoubleMemory);
+		return;
+	}
+	fDoubleBase[0] = fBase;
+	fDoublePhys[0] = (uint32_t) fb;
+	fDoubleBase[1] = second;
+	fDoublePhys[1] = (uint32_t) second_phys;
+	memcpy(fDoubleBase[1], fDoubleBase[0], (size_t) ((uint64_t) vinfo.v_rowbytes * vinfo.v_height));
+	fDoubleShown = 0;
+	fDouble = true;
+	fDeconTrig = false;                             /* (the trigger stays as it was: sending on every TE) */
+	snprintf(fDoubleSaid, sizeof(fDoubleSaid), "two framebuffers, %#x and %#x (%llu bytes), through the DPP channel whose "
+	    "address was the first", fDoublePhys[0], fDoublePhys[1], size);
+	IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
 }
 
 void
@@ -1170,6 +1318,29 @@ IOMobileFramebuffer::deconProbe(void)
 	vm_offset_t d = fDecon;
 
 	IOSleep(100000);
+	{
+		/* the DPP input channels: which reads what (fb_decon_double) */
+		static const uint32_t channels[] = { 0x14884000, 0x14883000, 0x14881000, 0x14882000 };
+		char line[300] = "";
+		size_t at = 0;
+		for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]); i++) {
+			vm_offset_t idma = ml_io_map(channels[i], 0x1000);
+			at += (size_t) snprintf(line + at, sizeof(line) - at, " %#x: enable %#x address %#x;", channels[i],
+			    idma ? *(volatile uint32_t *)(idma + IDMA_ENABLE_REG) : 0, idma ? *(volatile uint32_t *)(idma + IDMA_BASE_ADDR_Y) : 0);
+		}
+		IOLog("MiniIOMobileFramebuffer: fb_decon: DPP channels:%s shadow update %#x; boot framebuffer %#llx\n", line,
+		    deconRead(d, DECON_SHADOW), (uint64_t) vinfo.v_physaddr);
+		if (fDoubleSaid[0]) {
+			IOLog("MiniIOMobileFramebuffer: fb_decon_double: at the start: %s\n", fDoubleSaid);
+		} else if (gDeconDouble) {
+			IOLog("MiniIOMobileFramebuffer: fb_decon_double: asked for, but never set up\n");
+		}
+	}
+	while (fDouble) {
+		IOLog("MiniIOMobileFramebuffer: fb_decon_double: %u frames handed over, %u not taken within %u ms; shown now %#x\n",
+		    fDoubleSwaps, fDoubleLate, DECON_WAIT_MS, *(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y));
+		IOSleep(30000);
+	}
 	uint32_t trig = deconRead(d, DECON_TRIG), enable = deconRead(d, DECON_INT_ENABLE);
 	uint32_t pending = deconRead(d, DECON_INT_PENDING), frames0 = deconRead(d, DECON_FRAME_COUNT), te0 = deconRead(d, DECON_TE_CNT);
 	IOSleep(1000);
