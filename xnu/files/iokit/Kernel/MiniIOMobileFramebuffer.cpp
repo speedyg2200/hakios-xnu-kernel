@@ -1977,7 +1977,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (fBeamIntf != 0) {
 		/* (on the panel when that scan reads it: that is the beat now, kept by the panel) */
 		fStatOnBeat++;
-	} else if (gOnTheBeat && !fDeconTrig) {        /* (under DECON's trigger the panel's TE is the beat) */
+	} else if (gOnTheBeat && !fDeconTrig) {
+		/* (under DECON's trigger the panel's TE is the beat. With two framebuffers the beat stays: without it the wait
+		 * only moved to the next frame, which then waited for DECON to take this one -- 61% of frames over 16.7 ms
+		 * against 44% with it, 16 November) */
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
