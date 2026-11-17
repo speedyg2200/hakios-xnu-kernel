@@ -87,6 +87,8 @@ FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh 
 FB_DECON	arg	fb_decon	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_DECON_DOUBLE	arg	fb_decon_double	GPU and display	k	MiniIOMobileFramebuffer.cpp	two framebuffers, DECON shown one while the other is written (see deconDoubleSetup())
 FB_DECON_SECOND	arg	fb_decon_second	GPU and display	k	MiniIOMobileFramebuffer.cpp	the second buffer is memory the firmware keeps aside (on the Galaxy A51, the second half of UEFI's "Display Reserved", 0xCAA00000): mapped
+FB_DECON_SWITCH_IDLE	arg	fb_decon_switch_idle	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_DECON_THIRD	arg	fb_decon_third	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_DECON_TRIG	arg	fb_decon_trig	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_DIFF	arg	fb_diff	GPU and display	k	MiniIOMobileFramebuffer.cpp	which pixels of the panel each frame changed (it costs: the panel's memory is slow to read)
 FB_FILTER	arg	fb_filter	GPU and display	k	MiniIOMobileFramebuffer.cpp	the picture is scaled to the panel nearest neighbour, as it once was

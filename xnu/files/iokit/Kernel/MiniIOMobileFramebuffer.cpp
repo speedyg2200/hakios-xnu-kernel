@@ -322,6 +322,7 @@ static TUNABLE(uint32_t, gDeconTrig, "fb_decon_trig", 0);
 /* Boot-arg fb_decon_double=1: two framebuffers, DECON shown one while the other is written (see deconDoubleSetup()). */
 static TUNABLE(uint32_t, gDeconDouble, "fb_decon_double", 0);
 static TUNABLE(uint64_t, gDeconSecond, "fb_decon_second", 0);   /* the second buffer's physical address, if the firmware keeps one */
+static TUNABLE(uint64_t, gDeconThird, "fb_decon_third", 0);     /* ... and a third's (with fb_decon_second) */
 static TUNABLE(uint32_t, gDeconSwitchIdle, "fb_decon_switch_idle", 0);  /* a test: hand a frame over only between transfers */
 static vm_offset_t deconRegisters(void);
 
@@ -541,8 +542,11 @@ public:
 	/* fb_decon_double: the two framebuffers, the input channel DECON reads them through */
 	bool fDouble, fDoublePending;
 	unsigned fDoubleShown;
-	uint8_t * fDoubleBase[2];
-	uint32_t fDoublePhys[2];
+	uint8_t * fDoubleBase[3];
+	uint32_t fDoublePhys[3];
+	unsigned fDoubleCount;                          /* 2, or 3 with fb_decon_third */
+	unsigned fDoubleNext;                           /* (three: the buffer this frame is written into) */
+	uint32_t fDoubleReplaced;                       /* (three: frames handed over and replaced before DECON took them) */
 	vm_offset_t fDoubleIdma;
 	IOBufferMemoryDescriptor * fDoubleMemory;
 	uint32_t fDoubleSwaps, fDoubleLate;
@@ -1139,6 +1143,24 @@ deconWaitPending(vm_offset_t d, uint32_t bit)
 void
 IOMobileFramebuffer::deconBefore(void)
 {
+	if (fDouble && fDoubleCount == 3) {
+		/*
+		 * Three buffers: the frame goes into the one the channel neither reads (its active address, IDMA + 0x840) nor is
+		 * to read next (the address last written, 0x40, until DECON takes it at a frame's start) -- at once. With two the
+		 * frame waited first for the last switch to be taken: 7.3 ms of most frames on the A51, while CoreAnimation's
+		 * surface stayed held (17 November).
+		 */
+		uint32_t active = *(volatile uint32_t *)(fDoubleIdma + IDMA_ACTIVE + IDMA_BASE_ADDR_Y);
+		uint32_t requested = *(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y);
+		unsigned i = 0;
+
+		while (i < 2 && (fDoublePhys[i] == active || fDoublePhys[i] == requested)) {
+			i++;
+		}
+		fDoubleNext = i;
+		fBase = fDoubleBase[i];
+		return;
+	}
 	if (fDouble) {
 		/* the last frame's buffer is DECON's once the shadow update has happened (at a frame's start): the other is free */
 		if (fDoublePending) {
@@ -1224,6 +1246,19 @@ IOMobileFramebuffer::deconBefore(void)
 void
 IOMobileFramebuffer::deconAfter(void)
 {
+	if (fDouble && fDoubleCount == 3) {
+		/*
+		 * Handed over at once, taken at the next frame's start: one handed over before and not taken yet is replaced (it is
+		 * older; its buffer is not read, and is free again)
+		 */
+		__asm__ volatile ("dsb sy");                    /* (the frame's writes out of the write-combining buffers first) */
+		fDoubleReplaced += (deconRead(fDecon, DECON_SHADOW) & DECON_SHADOW_GLOBAL) != 0;
+		*(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y) = fDoublePhys[fDoubleNext];
+		deconWrite(fDecon, DECON_SHADOW, deconRead(fDecon, DECON_SHADOW) | DECON_SHADOW_WINDOWS | DECON_SHADOW_GLOBAL);
+		fDoubleShown = fDoubleNext;
+		fDoubleSwaps++;
+		return;
+	}
 	if (fDouble) {
 		/* the written buffer to the input channel, taken at the next frame's start (DECON's global shadow update) */
 		unsigned next = 1 - fDoubleShown;
@@ -1325,11 +1360,35 @@ IOMobileFramebuffer::deconDoubleSetup(void)
 			fDoubleBase[1] = second;
 			fDoublePhys[1] = (uint32_t) second_phys_given;
 			memcpy(fDoubleBase[1], fDoubleBase[0], (size_t) ((uint64_t) vinfo.v_rowbytes * vinfo.v_height));
+			fDoubleCount = 2;
+			/* ... and fb_decon_third, the same way (on the A51 0xCB400000, in the 30 MB UEFI keeps from 0xCA000000) */
+			if (gDeconThird != 0 && (gDeconThird >> 32) == 0 && (gDeconThird & PAGE_MASK) == 0 &&
+			    (gDeconThird >= second_phys_given + size || gDeconThird + size <= second_phys_given) &&
+			    (gDeconThird >= fb + size || gDeconThird + size <= fb)) {
+				IOMemoryDescriptor * third_md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) gDeconThird,
+				    (IOByteCount) size, kIODirectionInOut);
+				IOMemoryMap * third_map = third_md != NULL ? third_md->createMappingInTask(kernel_task, 0, kIOMapAnywhere |
+				    kIOMapWriteCombineCache) : NULL;
+				if (third_map != NULL) {
+					fDoubleBase[2] = (uint8_t *) third_map->getVirtualAddress();
+					fDoublePhys[2] = (uint32_t) gDeconThird;
+					memcpy(fDoubleBase[2], fDoubleBase[0], (size_t) ((uint64_t) vinfo.v_rowbytes * vinfo.v_height));
+					fDoubleCount = 3;
+				} else {
+					OSSafeReleaseNULL(third_md);
+					IOLog("MiniIOMobileFramebuffer: fb_decon_third %#llx could not be mapped: two buffers\n", gDeconThird);
+				}
+			}
 			fDoubleShown = 0;
 			fDouble = true;
 			fDeconTrig = false;
-			snprintf(fDoubleSaid, sizeof(fDoubleSaid), "two framebuffers, %#x and %#x (the firmware's, fb_decon_second; %llu bytes)",
-			    fDoublePhys[0], fDoublePhys[1], size);
+			if (fDoubleCount == 3) {
+				snprintf(fDoubleSaid, sizeof(fDoubleSaid), "three framebuffers, %#x, %#x and %#x (the firmware's, fb_decon_second "
+				    "and fb_decon_third; %llu bytes)", fDoublePhys[0], fDoublePhys[1], fDoublePhys[2], size);
+			} else {
+				snprintf(fDoubleSaid, sizeof(fDoubleSaid), "two framebuffers, %#x and %#x (the firmware's, fb_decon_second; %llu bytes)",
+				    fDoublePhys[0], fDoublePhys[1], size);
+			}
 			IOLog("MiniIOMobileFramebuffer: fb_decon_double: %s\n", fDoubleSaid);
 			return;
 		}
@@ -1358,6 +1417,7 @@ IOMobileFramebuffer::deconDoubleSetup(void)
 	fDoubleBase[1] = second;
 	fDoublePhys[1] = (uint32_t) second_phys;
 	memcpy(fDoubleBase[1], fDoubleBase[0], (size_t) ((uint64_t) vinfo.v_rowbytes * vinfo.v_height));
+	fDoubleCount = 2;
 	fDoubleShown = 0;
 	fDouble = true;
 	fDeconTrig = false;                             /* (the trigger stays as it was: sending on every TE) */
@@ -1502,6 +1562,11 @@ IOMobileFramebuffer::deconProbe(void)
 		    "not yet the shown buffer's when DECON's update was done %u times (%llu us each, %u never within 20 ms); active now %#x\n",
 		    fDoubleAtOnce, fDoubleNotYet, fDoubleNotYet != 0 ? notYetUs / fDoubleNotYet : 0, fDoubleNever,
 		    *(volatile uint32_t *)(fDoubleIdma + IDMA_ACTIVE + IDMA_BASE_ADDR_Y));
+		if (fDoubleCount == 3) {
+			IOLog("MiniIOMobileFramebuffer: fb_decon_double: three buffers, 30 s: %u frames replaced before DECON took them\n",
+			    fDoubleReplaced);
+			fDoubleReplaced = 0;
+		}
 		fDoubleAtOnce = fDoubleNotYet = fDoubleNever = 0;
 		fDoubleNotYetTime = 0;
 		IOLog("MiniIOMobileFramebuffer: pictures, 30 s: %u of %u frames the same as the one before (%u in a row at the most)\n",
@@ -2204,10 +2269,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (fBeamIntf != 0) {
 		/* (on the panel when that scan reads it: that is the beat now, kept by the panel) */
 		fStatOnBeat++;
-	} else if (gOnTheBeat && !fDeconTrig) {
+	} else if (gOnTheBeat && !fDeconTrig && !(fDouble && fDoubleCount == 3)) {
 		/* (under DECON's trigger the panel's TE is the beat. With two framebuffers the beat stays: without it the wait
 		 * only moved to the next frame, which then waited for DECON to take this one -- 61% of frames over 16.7 ms
-		 * against 44% with it, 16 November) */
+		 * against 44% with it, 16 November. With three nothing waits for DECON, and a frame is written as soon as it
+		 * comes: the beat held most frames 7.3 ms, CoreAnimation's surface with them, 17 November) */
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);

@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **356 arguments**: 284 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **358 arguments**: 286 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (83)
+## GPU and display (85)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -32,6 +32,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `fb_decon` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON` |  |
 | `fb_decon_double` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON_DOUBLE` |  |
 | `fb_decon_second` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON_SECOND` |  |
+| `fb_decon_switch_idle` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON_SWITCH_IDLE` |  |
+| `fb_decon_third` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON_THIRD` |  |
 | `fb_decon_trig` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DECON_TRIG` |  |
 | `fb_diff` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_DIFF` |  |
 | `fb_filter` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_FILTER` |  |
