@@ -320,6 +320,7 @@ static TUNABLE(uint32_t, gDeconTrig, "fb_decon_trig", 0);
 /* Boot-arg fb_decon_double=1: two framebuffers, DECON shown one while the other is written (see deconDoubleSetup()). */
 static TUNABLE(uint32_t, gDeconDouble, "fb_decon_double", 0);
 static TUNABLE(uint64_t, gDeconSecond, "fb_decon_second", 0);   /* the second buffer's physical address, if the firmware keeps one */
+static TUNABLE(uint32_t, gDeconSwitchIdle, "fb_decon_switch_idle", 0);  /* a test: hand a frame over only between transfers */
 static vm_offset_t deconRegisters(void);
 
 static uint64_t
@@ -481,10 +482,14 @@ public:
 	uint64_t        fStatRowGap;                    /* the longest one row took (absolute time) */
 	uint32_t        fStatRowsSlow, fStatRows;       /* rows that took over 1 ms, of all */
 	uint32_t        fStatClientLayers;              /* layers whose surface is around a program's own memory */
+	uint32_t        fStatPartial, fStatPartialRecent;       /* layers that did not cover the panel: all, lately */
 	uint32_t        fStatSettleReused;      /* ... frames not drawn again filtered: the GPU had their surface for the next frame */
 	uint64_t        fReady;                 /* when the last frame was ready to be shown */
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
 	uint32_t        fStatSettled;           /* frames drawn again, filtered, once they stood still (fb_filter=2) */
+	uint32_t        fStatSame, fStatSampled;        /* frames whose picture was the one before's (1024 pixels compared), of all */
+	uint32_t        fSameRun, fSameRunWorst;        /* ... the most of them in a row */
+	uint64_t        fLastPicture;                   /* ... what the last one's pixels added up to */
 	uint64_t        fStatBeatWait;
 	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
 	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
@@ -1185,6 +1190,17 @@ IOMobileFramebuffer::deconAfter(void)
 		/* the written buffer to the input channel, taken at the next frame's start (DECON's global shadow update) */
 		unsigned next = 1 - fDoubleShown;
 		__asm__ volatile ("dsb sy");                    /* (the frame's writes out of the write-combining buffers first) */
+		if (gDeconSwitchIdle) {
+			/*
+			 * (a test, fb_decon_switch_idle=1: the address written only between a transfer's end and the next TE, in case
+			 * the DPP channel takes it at once rather than at the next frame's start -- a transfer is 13 ms of a 16.7 ms
+			 * refresh, so most writes would land inside one; a fixed tear line was seen at 240 frames a second)
+			 */
+			deconWrite(fDecon, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+			for (uint32_t us = 0; us < 20000 && !(deconRead(fDecon, DECON_INT_PENDING) & DECON_FRAME_DONE); us += 25) {
+				IODelay(25);
+			}
+		}
 		*(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y) = fDoublePhys[next];
 		deconWrite(fDecon, DECON_SHADOW, deconRead(fDecon, DECON_SHADOW) | DECON_SHADOW_GLOBAL);
 		fDoubleShown = next;
@@ -1336,9 +1352,109 @@ IOMobileFramebuffer::deconProbe(void)
 			IOLog("MiniIOMobileFramebuffer: fb_decon_double: asked for, but never set up\n");
 		}
 	}
+	{
+		/*
+		 * How long a transfer to the panel takes: from a TE (HW_TE_CNT moving) to FRAME_DONE, 20 times. A panel in command mode
+		 * shows its own memory from the TE on while the transfer fills it; a transfer about as long as the panel's scan
+		 * lets the scan overtake it somewhere -- a fixed tear line that no buffering of ours can prevent (seen at 240
+		 * frames a second, 16 November). Reads, and the pending bits cleared (written 1); needs the trigger sending on
+		 * every TE (with fb_decon_double it is; with fb_decon_trig it is not, and this says so).
+		 */
+		uint64_t ns_min = ~0ULL, ns_max = 0, ns_sum = 0, period_sum = 0, last_te_at = 0, limit;
+		uint32_t got = 0, periods = 0;
+		nanoseconds_to_absolutetime(40 * NSEC_PER_MSEC, &limit);
+		for (int i = 0; i < 20; i++) {
+			uint32_t te = deconRead(d, DECON_TE_CNT) & 0xffff;
+			uint64_t t0 = mach_absolute_time();
+			while ((deconRead(d, DECON_TE_CNT) & 0xffff) == te && mach_absolute_time() - t0 < limit) {
+			}
+			uint64_t te_at = mach_absolute_time();
+			deconWrite(d, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+			if (last_te_at != 0) {
+				period_sum += te_at - last_te_at;
+				periods++;
+			}
+			last_te_at = te_at;
+			while (!(deconRead(d, DECON_INT_PENDING) & DECON_FRAME_DONE) && mach_absolute_time() - te_at < limit) {
+			}
+			uint64_t done_at = mach_absolute_time(), ns;
+			if (done_at - te_at >= limit) {
+				continue;
+			}
+			absolutetime_to_nanoseconds(done_at - te_at, &ns);
+			ns_min = ns < ns_min ? ns : ns_min;
+			ns_max = ns > ns_max ? ns : ns_max;
+			ns_sum += ns;
+			got++;
+		}
+		uint64_t period_ns = 0;
+		if (periods != 0) {
+			absolutetime_to_nanoseconds(period_sum / periods, &period_ns);
+		}
+		/* the DSI controller as the boot loader set it (dt dsim@0x148E0000; its PLL and lane settings, for the link's speed) */
+		vm_offset_t dsim = ml_io_map(0x148E0000, 0x1000);
+		if (dsim != 0) {
+			char words[64 * 9 + 1] = "";
+			size_t at = 0;
+			for (uint32_t off = 0; off < 0x100; off += 4) {
+				at += (size_t) snprintf(words + at, sizeof(words) - at, " %08x", *(volatile uint32_t *)(dsim + off));
+			}
+			IOLog("MiniIOMobileFramebuffer: fb_decon: DSIM 0x148e0000 0x00-0xfc:%s\n", words);
+		}
+		IOLog("MiniIOMobileFramebuffer: fb_decon: a transfer to the panel, TE to FRAME_DONE: %u of 20 seen; %llu us at the least, "
+		    "%llu on the average, %llu at the most; TEs %llu us apart (trigger control %#x)\n", got,
+		    got ? ns_min / 1000 : 0, got ? ns_sum / got / 1000 : 0, ns_max / 1000, period_ns / 1000, deconRead(d, DECON_TRIG));
+	}
+	if (fDouble) {
+		/*
+		 * Every transfer for 30 s from 110 s on, while frames are being drawn: idle, a transfer is 13.0 ms to the
+		 * microsecond; one that DECON is slowed in (its reads of memory against the copy's writes and the GPU) would let
+		 * the panel's scan overtake it -- the fixed tear line seen at 40-45% of the panel's height (16 November).
+		 * Spinning on one processor meanwhile.
+		 */
+		uint32_t buckets[12] = { 0 }, seen = 0, missed = 0;
+		uint64_t worst = 0, limit, window, began_at;
+		IOSleep(10000);
+		nanoseconds_to_absolutetime(40 * NSEC_PER_MSEC, &limit);
+		nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &window);
+		began_at = mach_absolute_time();
+		while (mach_absolute_time() - began_at < window) {
+			uint32_t te = deconRead(d, DECON_TE_CNT) & 0xffff;
+			uint64_t t0 = mach_absolute_time();
+			while ((deconRead(d, DECON_TE_CNT) & 0xffff) == te && mach_absolute_time() - t0 < limit) {
+			}
+			uint64_t te_at = mach_absolute_time(), ns;
+			deconWrite(d, DECON_INT_PENDING, DECON_FRAME_START | DECON_FRAME_DONE);
+			while (!(deconRead(d, DECON_INT_PENDING) & DECON_FRAME_DONE) && mach_absolute_time() - te_at < limit) {
+			}
+			uint64_t done_at = mach_absolute_time();
+			if (done_at - te_at >= limit) {
+				missed++;
+				continue;
+			}
+			absolutetime_to_nanoseconds(done_at - te_at, &ns);
+			worst = ns > worst ? ns : worst;
+			unsigned ms = (unsigned) (ns / 1000000);
+			buckets[ms < 10 ? 0 : ms - 10 < 11 ? ms - 10 : 11]++;
+			seen++;
+		}
+		IOLog("MiniIOMobileFramebuffer: fb_decon: transfers while drawing, 30 s: %u (%u not done in 40 ms); under 11 ms %u, "
+		    "11 ms %u, 12 ms %u, 13 ms %u, 14 ms %u, 15 ms %u, 16 ms %u, 17-20 ms %u, longer %u; the longest %llu us\n", seen,
+		    missed, buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6],
+		    buckets[7] + buckets[8] + buckets[9] + buckets[10], buckets[11], worst / 1000);
+	}
 	while (fDouble) {
-		IOLog("MiniIOMobileFramebuffer: fb_decon_double: %u frames handed over, %u not taken within %u ms; shown now %#x\n",
-		    fDoubleSwaps, fDoubleLate, DECON_WAIT_MS, *(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y));
+		uint32_t waits, timeouts;
+		uint64_t waited;
+
+		MiniIOSurfaceShownStats(&waits, &waited, &timeouts);
+		IOLog("MiniIOMobileFramebuffer: pictures, 30 s: %u of %u frames the same as the one before (%u in a row at the most)\n",
+		    fStatSame, fStatSampled, fSameRunWorst);
+		fStatSame = fStatSampled = fSameRunWorst = 0;
+		IOLog("MiniIOMobileFramebuffer: fb_decon_double: %u frames handed over, %u not taken within %u ms; shown now %#x; "
+		    "GPU submissions held for a surface being shown, 30 s: %u (%llu us each, %u in vain)\n",
+		    fDoubleSwaps, fDoubleLate, DECON_WAIT_MS, *(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y),
+		    waits, waits != 0 ? waited / waits : 0, timeouts);
 		IOSleep(30000);
 	}
 	uint32_t trig = deconRead(d, DECON_TRIG), enable = deconRead(d, DECON_INT_ENABLE);
@@ -1712,6 +1828,14 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.scan = fSettling ? 0 : fBeamScan;
 	fStatLayers++;
 	fStatClientLayers += s->client != NULL;
+	/* (a layer that does not cover the panel leaves the rest of the buffer as it was -- with two buffers, two frames old) */
+	if (job.ry0 > 0 || job.ry1 < (int32_t) fPanelHeight || cx0 > 0 || cx1 < (int32_t) fPanelWidth) {
+		if (fStatPartial++ < 6) {
+			IOLog("MiniIOMobileFramebuffer: a layer covers only part of the panel: rows %d to %d, columns %d to %d (of %ux%u)\n",
+			    job.ry0, job.ry1, cx0, cx1, fPanelWidth, fPanelHeight);
+		}
+		fStatPartialRecent++;
+	}
 	fStatScaled += !job.unscaled;
 	fStatFiltered += filter;
 	fStatUnscaled += job.unscaled;
@@ -1819,6 +1943,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
+		MiniIOSurfaceUse(fSwapSurfaces[slot][layer], +1);       /* in use to CoreAnimation until it is copied out */
 	}
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
@@ -1909,6 +2034,32 @@ IOMobileFramebuffer::presenter(void)
 				shownDrawn[layer] = surfaces[layer] != NULL ? surfaces[layer]->drawn : 0;
 			}
 			show(swap, surfaces);
+			/*
+			 * Whether the picture changed at all: a frame the same as the one before was drawn for nothing (the page
+			 * under a moving finger stood still for some 50 ms at a time in a video while frames came at 45 a second,
+			 * 16 November). 32 x 32 pixels across the first layer, added up.
+			 */
+			if (surfaces[0] != NULL && surfaces[0]->info.bytesPerElement == 4 && surfaces[0]->info.width != 0) {
+				MiniIOSurface * s0 = surfaces[0];
+				uint64_t sum = 1469598103934665603ULL;
+
+				for (uint32_t gy = 0; gy < 32; gy++) {
+					const uint8_t * row = s0->pixels() + (uint64_t) (s0->info.height * (2 * gy + 1) / 64) * s0->info.bytesPerRow;
+
+					for (uint32_t gx = 0; gx < 32; gx++) {
+						sum = (sum ^ *(const volatile uint32_t *) (row + 4 * (s0->info.width * (2 * gx + 1) / 64))) * 1099511628211ULL;
+					}
+				}
+				fStatSampled++;
+				if (sum == fLastPicture) {
+					fStatSame++;
+					fSameRun++;
+					fSameRunWorst = fSameRun > fSameRunWorst ? fSameRun : fSameRunWorst;
+				} else {
+					fSameRun = 0;
+				}
+				fLastPicture = sum;
+			}
 			lastFrame = mach_absolute_time();
 		}
 		unsettled = gFilter == 2 && !fFilterFrame;
@@ -1920,6 +2071,7 @@ IOMobileFramebuffer::presenter(void)
 		 */
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
+				MiniIOSurfaceUse(surfaces[layer], -1);  /* (copied out: CoreAnimation may draw into it again) */
 				MiniIOSurfaceDrop(surfaces[layer]);
 				surfaces[layer] = NULL;
 			}
@@ -2136,11 +2288,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			absolutetime_to_nanoseconds(fStatRowGap, &gap);
 			IOLog("MiniIOMobileFramebuffer: %u layers drawn (%u scaled, %u of them filtered, %u copied as they are); shares:%s; "
 			    "recording %llu us a frame; rows: %u, %u of them over 1 ms, the longest %llu us; %u layers around a program's own "
-			    "memory; surfaces lately: %u %u %u %u %u %u %u %u\n", fStatLayers, fStatScaled,
+			    "memory; %u covering only part of the panel; surfaces lately: %u %u %u %u %u %u %u %u\n", fStatLayers, fStatScaled,
 			    fStatFiltered, fStatUnscaled, shares, recording / fStatFrames / NSEC_PER_USEC, fStatRows, fStatRowsSlow,
-			    gap / NSEC_PER_USEC, fStatClientLayers, fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
+			    gap / NSEC_PER_USEC, fStatClientLayers, fStatPartialRecent, fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
 			    fStatSurfaces[4], fStatSurfaces[5], fStatSurfaces[6], fStatSurfaces[7]);
 			fStatClientLayers = 0;
+			fStatPartialRecent = 0;
 			fStatLayers = fStatScaled = fStatFiltered = fStatUnscaled = 0;
 			fStatRecord = 0;
 			fStatRowGap = 0;

@@ -772,6 +772,88 @@ MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)
 	*bytes = gSurfaceBytes;
 }
 
+/*
+ * The display's own use of a surface, as IOSurfaceIsInUse() sees it (the use count in the shared page, category 0): from
+ * the swap that names it until its pixels are copied out. Without it a surface queued or being copied was free to
+ * CoreAnimation, which drew its next-but-one frame into it meanwhile -- a frame torn where the GPU's drawing met the
+ * copy, at a fixed height (the Galaxy A51, seen at 240 frames a second, 16 November).
+ */
+void
+MiniIOSurfaceUse(MiniIOSurface * s, int delta)
+{
+	if (s == NULL || gSurfaceLock == NULL) {
+		return;
+	}
+	IOLockLock(gSurfaceLock);
+	if (delta > 0 || s->useCount[0] >= (uint32_t) -delta) {
+		s->useCount[0] += delta;
+		s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
+	}
+	if (delta > 0 || s->displaying >= (uint32_t) -delta) {
+		s->displaying += delta;
+		if (s->displaying == 0) {
+			IOLockWakeup(gSurfaceLock, &s->displaying, false);
+		}
+	}
+	IOLockUnlock(gSurfaceLock);
+}
+
+/*
+ * CoreAnimation does not ask IOSurfaceIsInUse() of the surfaces it draws the screen into: it went on drawing its next frame
+ * into one the display was still copying (pieces of icons missing at the height the copy had reached, 16 November, even
+ * with the use count above). So the GPU's driver holds back a submission that names a surface until it is copied out.
+ */
+static uint32_t gShownWaits, gShownTimeouts;
+static uint64_t gShownWaited;
+
+bool
+MiniIOSurfaceWaitShown(MiniIOSurface * s, uint64_t milliseconds)
+{
+	uint64_t began, deadline;
+	bool done = true;
+
+	if (s == NULL || gSurfaceLock == NULL || s->displaying == 0) {
+		return true;
+	}
+	began = mach_absolute_time();
+	clock_interval_to_deadline((uint32_t) milliseconds, kMillisecondScale, &deadline);
+	IOLockLock(gSurfaceLock);
+	if (s->displaying != 0) {
+		gShownWaits++;
+		while (s->displaying != 0) {
+			if (IOLockSleepDeadline(gSurfaceLock, &s->displaying, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+			    s->displaying != 0) {
+				gShownTimeouts++;
+				done = false;
+				break;
+			}
+		}
+		gShownWaited += mach_absolute_time() - began;
+	}
+	IOLockUnlock(gSurfaceLock);
+	return done;
+}
+
+void
+MiniIOSurfaceShownStats(uint32_t * waits, uint64_t * waited, uint32_t * timeouts)
+{
+	uint64_t nanos;
+
+	if (gSurfaceLock == NULL) {
+		*waits = *timeouts = 0;
+		*waited = 0;
+		return;
+	}
+	IOLockLock(gSurfaceLock);
+	absolutetime_to_nanoseconds(gShownWaited, &nanos);
+	*waits = gShownWaits;
+	*waited = nanos / 1000;
+	*timeouts = gShownTimeouts;
+	gShownWaits = gShownTimeouts = 0;
+	gShownWaited = 0;
+	IOLockUnlock(gSurfaceLock);
+}
+
 void
 MiniIOSurfaceDrop(MiniIOSurface * s)
 {

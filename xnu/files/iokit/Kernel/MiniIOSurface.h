@@ -122,6 +122,7 @@ public:
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
+	uint32_t                        displaying;     /* swaps that name it and are not copied out yet (MiniIOSurfaceUse) */
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
@@ -167,6 +168,15 @@ void            MiniIOSurfaceClearKept(void);
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
+/* The display's use of a surface, up (+1) and down (-1): what IOSurfaceIsInUse() reports to the one who draws into it. */
+void            MiniIOSurfaceUse(MiniIOSurface * surface, int delta);
+/*
+ * For the GPU's driver, before a submission that names the surface: wait, so many milliseconds at most, until the display
+ * has copied it out (false: it had not by then). Drawing into it meanwhile is drawing into the picture being copied.
+ */
+bool            MiniIOSurfaceWaitShown(MiniIOSurface * surface, uint64_t milliseconds);
+/* How often that waited since this was last asked, for how long in all (microseconds), and how often in vain. */
+void            MiniIOSurfaceShownStats(uint32_t * waits, uint64_t * waited, uint32_t * timeouts);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
 
