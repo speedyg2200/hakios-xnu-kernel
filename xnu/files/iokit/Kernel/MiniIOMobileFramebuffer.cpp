@@ -544,6 +544,14 @@ public:
 	vm_offset_t fDoubleIdma;
 	IOBufferMemoryDescriptor * fDoubleMemory;
 	uint32_t fDoubleSwaps, fDoubleLate;
+	/*
+	 * ... what the channel itself reads (its active copy of the address, IDMA + 0x840: Samsung's dma_dump_regs): taken at
+	 * once when written (no frame's start between: a switch inside a transfer), not yet taken when DECON's update bit had
+	 * cleared (the next frame waited for it), and how long that took
+	 */
+	uint32_t fDoubleAtOnce, fDoubleNotYet, fDoubleNever, fDoubleNeverRun;
+	bool fDoubleUnchecked;                          /* the active address never followed: not looked at any more */
+	uint64_t fDoubleNotYetTime;
 	char fDoubleSaid[200];                          /* what deconDoubleSetup() found, said again by the probe */
 	void deconDoubleSetup(void);
 	uint32_t fDeconFrames, fDeconLate, fDeconWaitDone, fDeconTorn, fDeconExtra;
@@ -1076,8 +1084,10 @@ IOMobileFramebuffer * IOMobileFramebuffer::gBenchSelf;
 #define DECON_WAIT_MS           50
 #define DECON_SHADOW            0x060
 #define DECON_SHADOW_GLOBAL     (1u << 31)
+#define DECON_SHADOW_WINDOWS    0x3fu                   /* each window's own update, SHADOW_REG_UPDATE_REQ_FOR_DECON */
 #define IDMA_ENABLE_REG         0x000
 #define IDMA_BASE_ADDR_Y        0x040
+#define IDMA_ACTIVE             0x800                   /* the channel's active registers, the ones it reads by (dma_dump_regs) */
 
 static vm_offset_t
 deconRegisters(void)
@@ -1132,7 +1142,7 @@ IOMobileFramebuffer::deconBefore(void)
 		if (fDoublePending) {
 			bool applied = false;
 			for (uint32_t us = 0; us < DECON_WAIT_MS * 1000; us += 50) {
-				if (!(deconRead(fDecon, DECON_SHADOW) & DECON_SHADOW_GLOBAL)) {
+				if (!(deconRead(fDecon, DECON_SHADOW) & (DECON_SHADOW_GLOBAL | DECON_SHADOW_WINDOWS))) {
 					applied = true;
 					break;
 				}
@@ -1140,6 +1150,32 @@ IOMobileFramebuffer::deconBefore(void)
 			}
 			fDoubleLate += !applied;
 			fDoublePending = false;
+			/*
+			 * ... and the channel's own active address has to be the new buffer's as well, or the one about to be written
+			 * is still being read (a tear where the writing overtakes the transfer)
+			 */
+			volatile uint32_t * active = (volatile uint32_t *)(fDoubleIdma + IDMA_ACTIVE + IDMA_BASE_ADDR_Y);
+			/* (only while it reads the other buffer by name: should 0x840 be something else here, nothing waits) */
+			if (!fDoubleUnchecked && *active == fDoublePhys[1 - fDoubleShown]) {
+				uint64_t began = mach_absolute_time();
+				uint32_t us = 0;
+
+				fDoubleNotYet++;
+				for (; us < 20000 && *active == fDoublePhys[1 - fDoubleShown]; us += 25) {
+					IODelay(25);
+				}
+				if (*active == fDoublePhys[1 - fDoubleShown]) {
+					fDoubleNever++;
+					if (++fDoubleNeverRun >= 8) {
+						fDoubleUnchecked = true;
+						IOLog("MiniIOMobileFramebuffer: fb_decon_double: the channel's active address (%#x) did not follow 8 "
+						    "switches in a row: no longer waited for\n", *active);
+					}
+				} else {
+					fDoubleNeverRun = 0;
+				}
+				fDoubleNotYetTime += mach_absolute_time() - began;
+			}
 		}
 		fBase = fDoubleBase[1 - fDoubleShown];
 		return;
@@ -1202,7 +1238,15 @@ IOMobileFramebuffer::deconAfter(void)
 			}
 		}
 		*(volatile uint32_t *)(fDoubleIdma + IDMA_BASE_ADDR_Y) = fDoublePhys[next];
-		deconWrite(fDecon, DECON_SHADOW, deconRead(fDecon, DECON_SHADOW) | DECON_SHADOW_GLOBAL);
+		__asm__ volatile ("dsb sy");
+		fDoubleAtOnce += *(volatile uint32_t *)(fDoubleIdma + IDMA_ACTIVE + IDMA_BASE_ADDR_Y) == fDoublePhys[next];
+		/*
+		 * The windows' update bits with the global one, as Samsung's driver commits a frame (decon_reg_all_win_shadow_update_req,
+		 * then decon_reg_update_req_global): with the global bit alone the channel's active address (IDMA + 0x840) stayed the
+		 * boot framebuffer's -- the second buffer was never shown, and every other frame was written into the one being sent
+		 * (17 November)
+		 */
+		deconWrite(fDecon, DECON_SHADOW, deconRead(fDecon, DECON_SHADOW) | DECON_SHADOW_WINDOWS | DECON_SHADOW_GLOBAL);
 		fDoubleShown = next;
 		fDoublePending = true;
 		fDoubleSwaps++;
@@ -1448,6 +1492,16 @@ IOMobileFramebuffer::deconProbe(void)
 		uint64_t waited;
 
 		MiniIOSurfaceShownStats(&waits, &waited, &timeouts);
+		uint64_t notYetUs;
+
+		absolutetime_to_nanoseconds(fDoubleNotYetTime, &notYetUs);
+		notYetUs /= 1000;
+		IOLog("MiniIOMobileFramebuffer: fb_decon_double: the channel's own address, 30 s: taken as soon as written %u times; "
+		    "not yet the shown buffer's when DECON's update was done %u times (%llu us each, %u never within 20 ms); active now %#x\n",
+		    fDoubleAtOnce, fDoubleNotYet, fDoubleNotYet != 0 ? notYetUs / fDoubleNotYet : 0, fDoubleNever,
+		    *(volatile uint32_t *)(fDoubleIdma + IDMA_ACTIVE + IDMA_BASE_ADDR_Y));
+		fDoubleAtOnce = fDoubleNotYet = fDoubleNever = 0;
+		fDoubleNotYetTime = 0;
 		IOLog("MiniIOMobileFramebuffer: pictures, 30 s: %u of %u frames the same as the one before (%u in a row at the most)\n",
 		    fStatSame, fStatSampled, fSameRunWorst);
 		fStatSame = fStatSampled = fSameRunWorst = 0;
