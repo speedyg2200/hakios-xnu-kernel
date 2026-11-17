@@ -89,6 +89,19 @@ call(unsigned number, void *data, size_t size)
 
 static int panfrost_submit(struct drm_panfrost_submit *submit);
 
+/*
+ * Whether a BO is idle, answered here when it can be (DRM_PANFROST_WAIT_BO): Mesa's BO cache asks of every BO it takes
+ * out again, some 1200 times a second in the window server, and each is a round trip to the kernel for a microsecond of
+ * work there -- 4.3% of the drawing thread (glprof, 17 November). The kernel goes by the last submission of this
+ * connection that named the BO (HakiosMali's b->fence); so does this, from the submissions it passes on, and from the
+ * last fence it has heard is over. Only what it cannot tell from those goes to the kernel, as a wait for that fence,
+ * which says how far the GPU has got as well.
+ */
+#define BO_HANDLES      8192                    /* HakiosMali's MALI_BUFFERS: handles are 1 to this */
+static uint32_t bo_fence[BO_HANDLES + 1];       /* the last submission that named each, 0: none since it was made */
+static uint32_t fences_over;                    /* the last fence known to be over */
+static int panfrost_wait_bo(struct drm_panfrost_wait_bo *wait);
+
 int
 drmIoctl(int fd, unsigned long request, void *arg)
 {
@@ -104,6 +117,15 @@ drmIoctl(int fd, unsigned long request, void *arg)
 		 */
 		((struct drm_panfrost_madvise *)arg)->retained = 1;
 		error = 0;
+	} else if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO) {
+		error = panfrost_wait_bo(arg);
+	} else if (panfrost && (request & 0xff) == (DRM_IOCTL_GEM_CLOSE & 0xff)) {
+		uint32_t handle = ((struct drm_gem_close *)arg)->handle;
+
+		error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
+		if (error == 0 && handle != 0 && handle <= BO_HANDLES) {
+			__atomic_store_n(&bo_fence[handle], 0, __ATOMIC_RELAXED);      /* (the handle is made again for another) */
+		}
 	} else if (panfrost && (request & 0xff) == DRM_COMMAND_BASE + DRM_PANFROST_MMAP_BO) {
 		/* ... and where to map a BO: always its handle in the upper half, as the kernel says (kPanfrostMmapBO) */
 		struct drm_panfrost_mmap_bo *mmap_bo = arg;
@@ -711,6 +733,15 @@ panfrost_submit(struct drm_panfrost_submit *submit)
 	uint32_t fence = submit->out_sync;
 	submit->out_sync = out;
 	__atomic_store_n(&last_fence, fence, __ATOMIC_RELEASE);
+	{
+		const uint32_t *handles = (const uint32_t *)(uintptr_t)submit->bo_handles;
+
+		for (uint32_t i = 0; handles != NULL && i < submit->bo_handle_count; i++) {
+			if (handles[i] != 0 && handles[i] <= BO_HANDLES) {
+				__atomic_store_n(&bo_fence[handles[i]], fence, __ATOMIC_RELAXED);
+			}
+		}
+	}
 	pthread_mutex_lock(&syncobj_lock);
 	struct syncobj *s = syncobj_of(out);
 	if (s != NULL) {
@@ -721,6 +752,33 @@ panfrost_submit(struct drm_panfrost_submit *submit)
 	pthread_cond_broadcast(&syncobj_submitted);
 	pthread_mutex_unlock(&syncobj_lock);
 	return 0;
+}
+
+/* DRM_PANFROST_WAIT_BO (timeout_ns: an absolute CLOCK_MONOTONIC time, as Mesa's pan_kmod passes it) */
+static int
+panfrost_wait_bo(struct drm_panfrost_wait_bo *wait)
+{
+	uint32_t handle = wait->handle, fence, over;
+
+	if (handle == 0 || handle > BO_HANDLES) {
+		return call(DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO, wait, sizeof(*wait));
+	}
+	fence = __atomic_load_n(&bo_fence[handle], __ATOMIC_RELAXED);
+	if (fence == 0 || (int32_t)(__atomic_load_n(&fences_over, __ATOMIC_ACQUIRE) - fence) >= 0) {
+		return 0;
+	}
+	/* not known yet: the kernel waits for that fence (until the deadline), and says how far it has got */
+	struct { uint32_t fence, completed; int64_t timeout_ns; } mali = { fence, 0, wait->timeout_ns };
+	int error = call(HAKIOS_MALI_WAIT_FENCE, &mali, sizeof(mali));
+
+	if (error != 0) {
+		return call(DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO, wait, sizeof(*wait));
+	}
+	over = __atomic_load_n(&fences_over, __ATOMIC_RELAXED);
+	while ((int32_t)(mali.completed - over) > 0 &&
+	    !__atomic_compare_exchange_n(&fences_over, &over, mali.completed, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+	}
+	return (int32_t)(mali.completed - fence) >= 0 ? 0 : ETIMEDOUT;
 }
 
 int
