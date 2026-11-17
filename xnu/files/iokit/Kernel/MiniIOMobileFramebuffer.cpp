@@ -268,6 +268,8 @@ static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
  */
 static TUNABLE(uint32_t, gBeam, "fb_beam", 1);
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+
 static inline uint32_t refreshHz(void);
 
 /*
@@ -2124,11 +2126,30 @@ IOMobileFramebuffer::presenter(void)
 		 * touch_lat=1). The filtered frame once they stop (fb_filter=2) takes them again by their IDs.
 		 */
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-			if (surfaces[layer] != NULL) {
-				MiniIOSurfaceUse(surfaces[layer], -1);  /* (copied out: CoreAnimation may draw into it again) */
-				MiniIOSurfaceDrop(surfaces[layer]);
-				surfaces[layer] = NULL;
+			MiniIOSurface * s = surfaces[layer];
+
+			if (s == NULL) {
+				continue;
 			}
+			/*
+			 * The first layer -- the window server's picture, which only the GPU draws -- out of the processor's cache
+			 * here, now that its rows have been read, rather than by the GPU's driver before the next submission that
+			 * draws into it: that took 2 ms of the window server's drawing thread a frame, 10 MB line by line (glprof,
+			 * 17 November). Released first (the GPU may draw into it meanwhile: the lines are clean, nothing is written
+			 * back), marked clean only once all of it is out.
+			 */
+			bool own = layer == 0 && s->client == NULL && s->kpixels == s->kbase + PAGE_SIZE;
+			if (own) {
+				s->shownClean = false;
+			}
+			MiniIOSurfaceUse(s, -1);                /* (copied out: CoreAnimation may draw into it again) */
+			if (own) {
+				flush_dcache64((addr64_t)(uintptr_t) s->kpixels, (unsigned) round_page_64(s->info.allocSize), FALSE);
+				__asm__ volatile ("dmb ish");
+				s->shownClean = true;
+			}
+			MiniIOSurfaceDrop(s);
+			surfaces[layer] = NULL;
 		}
 		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
 	}

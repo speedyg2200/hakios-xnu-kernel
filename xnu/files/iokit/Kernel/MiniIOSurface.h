@@ -123,6 +123,13 @@ public:
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
 	uint32_t                        displaying;     /* swaps that name it and are not copied out yet (MiniIOSurfaceUse) */
+	/*
+	 * The display's own picture (a swap's first layer, drawn by the GPU, read on the processor by the display alone),
+	 * put out of the processor's cache by the display once it had copied it: the GPU's driver need not push it out
+	 * again before drawing into it (hakios.mali.cpp). Not by its seed: the GL layer moves that at every glFlush of a
+	 * frame drawn into the surface's own memory, two a frame, with no processor's writing.
+	 */
+	volatile bool                   shownClean;
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
